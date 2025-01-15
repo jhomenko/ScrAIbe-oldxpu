@@ -16,12 +16,15 @@ LABEL url="https://github.com/JSchmie/ScrAIbe"
 WORKDIR /app
 #Enviorment dependencies
 ENV AUTOT_CACHE=/data/models/
+ENV LD_LIBRARY_PATH="$LD_LIBRARY_PATH:/opt/conda/lib/python3.11/site-packages/nvidia/cudnn/lib/"
+
 #Copy all necessary files 
 COPY README.md /app/src/README.md
 COPY scraibe /app/src/scraibe
 COPY pyproject.toml /app/src/pyproject.toml
 COPY LICENSE /app/src/LICENSE
 
+RUN mkdir -p /data
 
 #Installing all necessary Dependencies and Running the Application with a personalised Hugging-Face-Token
 RUN apt update -y && apt upgrade -y && \
@@ -32,7 +35,6 @@ RUN conda update --all -y && conda install -y -c conda-forge libsndfile && \
     conda clean --all -y
 
 RUN --mount=source=.git,target=.git,type=bind \
-#    --mount=source=scraibe_webui,target=scraibe_webui,type=bind \
     pip install --no-cache-dir ./src
 
 # Run the application
