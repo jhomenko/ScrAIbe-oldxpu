@@ -16,9 +16,8 @@ classifiers = [
                 'Development Status :: 4 - Beta',
                 'Intended Audience :: Developers',
                 'License :: OSI Approved :: GNU General Public License v3 (GPLv3)',
-                'Programming Language :: Python :: 3.8',
                 'Programming Language :: Python :: 3.11',
-                'Environment :: GPU :: NVIDIA CUDA :: 12 :: 12.1',
+                'Environment :: GPU :: NVIDIA CUDA :: 12 :: 12.4',
                 'Topic :: Scientific/Engineering :: Artificial Intelligence'
                 ]
 packages = [{include = "scraibe"}]
