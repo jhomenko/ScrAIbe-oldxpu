@@ -1,12 +1,8 @@
-
 services:
   scraibe:
-    image: scraibe-xpu:latest
+    image: scraibe-ipex:latest
     container_name: scraibe_xpu
-    entrypoint: [ "/bin/bash" ]
-    command: [ "-l" ]  # Login shell for interactive use    
-
-#    entrypoint: [ "tail", "-f", "/dev/null" ]
+    #    entrypoint: [ "tail", "-f", "/dev/null" ]
     #    command: []  # prevent auto-launch of WebUI
     volumes:
         - /tmp:/data
@@ -20,8 +16,4 @@ services:
         - LIBVA_DRIVER_NAME=iHD
         - AUTOT_CACHE=/data/models/
     restart: unless-stopped
-    env_file:
-      - .env
-    stdin_open: true      # <- needed for interactive mode
-    tty: true             # <- needed for interactive mode
-#    restart: no           # <- so it doesn’t restart on exit
+
