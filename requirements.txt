@@ -1,3 +1,14 @@
+--extra-index-url https://download.pytorch.org/whl/xpu
+
+# Update above --extra-index-url according to your device.
+
+## Nvidia GPU
+# CUDA 12.1 : https://download.pytorch.org/whl/cu121
+# CUDA 12.4 : https://download.pytorch.org/whl/cu124
+
+## Intel GPU
+# https://download.pytorch.org/whl/xpu
+
 tqdm>=4.66.5
 numpy>=1.26.4
 
@@ -6,9 +17,13 @@ faster-whisper~=1.0.3
 
 pyannote.audio~=3.3.1
 pyannote.core~=5.0.0
-pyannote.database~=5.0.1 
+pyannote.database~=5.0.1
 pyannote.metrics~=3.2.1
 pyannote.pipeline~=3.0.1
 
-torchaudio>=2.1.2
+torch>=2.7.0
+torchaudio>=2.7.0
 
+torchmetrics
+librosa
+insanely-fast-whisper

@@ -1,8 +1,7 @@
-#pytorch Image
-FROM pytorch/pytorch:2.3.1-cuda12.1-cudnn8-runtime
+# 🧱 Base image with Intel Arc GPU support and IPEX preinstalled
+FROM intel/intel-extension-for-pytorch:2.7.10-xpu
 
 # Labels
-
 LABEL maintainer="Jacob Schmieder"
 LABEL email="Jacob.Schmieder@dbfz.de"
 LABEL version="0.1.1.dev"
@@ -15,30 +14,29 @@ LABEL url="https://github.com/JSchmie/ScrAIbe"
 # Install dependencies
 WORKDIR /app
 #Enviorment dependencies
+ENV SYCL_DEVICE_FILTER=level_zero:gpu
+ENV IPEX_XPU_ONEDNN_LAYOUT=1
+ENV SCRAIBE_TORCH_DEVICE=xpu
 ENV TRANSFORMERS_CACHE=/app/models
 ENV HF_HOME=/app/models
 ENV AUTOT_CACHE=/app/models
 ENV PYANNOTE_CACHE=/app/models/pyannote
 #Copy all necessary files 
+
+#Installing all necessary dependencies and running the application with a personalised Hugging-Face-Token
+RUN apt update -y && apt upgrade -y && \
+    apt install -y libsm6 libxrender1 libfontconfig1 ffmpeg && \
+    apt clean && \
+    rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/*
+
+# Copy all necessary files
 COPY requirements.txt /app/requirements.txt
 COPY README.md /app/README.md
 COPY scraibe /app/scraibe
 
-#Installing all necessary dependencies and running the application with a personalised Hugging-Face-Token
-RUN apt update -y && apt upgrade -y && \
-    apt install -y libsm6 libxrender1 libfontconfig1 && \
-    apt clean && \
-    rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/*
-
-RUN conda update --all && \
-    # conda install -y pip ffmpeg && \
-    conda install -c conda-forge libsndfile && \
-    conda clean --all -y
-# RUN pip install torchaudio==0.11.0+cu113 -f https://download.pytorch.org/whl/torch_stable.html
+# Install Python dependencies using pip
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Expose port
-EXPOSE 7860
 # Run the application
 
-ENTRYPOINT ["python3", "-m",  "scraibe.cli"]  
+ENTRYPOINT ["python3", "-m", "scraibe.cli"]

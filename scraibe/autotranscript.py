@@ -26,6 +26,7 @@ Usage:
 # Standard Library Imports
 import os
 from glob import iglob
+import tempfile
 from subprocess import run
 from typing import TypeVar, Union
 from warnings import warn
@@ -33,7 +34,7 @@ from warnings import warn
 # Third-Party Imports
 import torch
 from numpy import ndarray
-from tqdm import trange
+import torchaudio
 
 # Application-Specific Imports
 from .audio import AudioProcessor
@@ -179,7 +180,23 @@ class Scraibe:
 
             audio = audio_file.cut(seg[0], seg[1])
 
-            transcript = self.transcriber.transcribe(audio, **kwargs)
+            # Check if the transcriber is InsanelyFastWhisperTranscriber
+            if isinstance(self.transcriber, InsanelyFastWhisperTranscriber):
+                # Save the audio segment to a temporary file
+                with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp_audio_file:
+                    tmp_audio_path = tmp_audio_file.name
+                    # Reshape audio tensor to have shape [channels, samples] for torchaudio.save
+                    torchaudio.save(tmp_audio_path, audio.unsqueeze(0), audio_file.sr)
+
+                try:
+                    # Transcribe from the temporary file
+                    transcript = self.transcriber.transcribe(tmp_audio_path, **kwargs)
+                finally:
+                    # Remove the temporary file
+                    os.remove(tmp_audio_path)
+            else:
+                # Transcribe directly from the tensor for other transcribers
+                transcript = self.transcriber.transcribe(audio, **kwargs)
 
             final_transcript[i] = {"speakers": diarisation["speakers"][i],
                                    "segments": seg,

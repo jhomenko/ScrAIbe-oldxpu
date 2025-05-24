@@ -36,7 +36,7 @@ from typing import TypeVar, Union
 from pyannote.audio import Pipeline
 from pyannote.audio.pipelines.speaker_diarization import SpeakerDiarization
 from torch import Tensor
-from torch import device as torch_device
+import torch
 
 from huggingface_hub import HfApi
 from huggingface_hub.utils import RepositoryNotFoundError
@@ -190,7 +190,7 @@ class Diariser:
                    cache_token: bool = False,
                    cache_dir: Union[Path, str] = PYANNOTE_DEFAULT_PATH,
                    hparams_file: Union[str, Path] = None,
-                   device: str = SCRAIBE_TORCH_DEVICE,
+                   device: Optional[str] = SCRAIBE_TORCH_DEVICE,
                    ) -> Pipeline:
         """
         Loads a pretrained model from pyannote.audio, 
@@ -281,9 +281,16 @@ class Diariser:
             raise ValueError('Unable to load model either from local cache'
                              'or from huggingface.co models. Please check your token'
                              'or your local model path')
+        
+        # Determine the device to use
+        if torch.cuda.is_available() and device == 'cuda':
+            target_device = 'cuda'
+        elif hasattr(torch, 'xpu') and torch.xpu.is_available():
+            target_device = 'xpu'
+        else:
+            target_device = device if device is not None else 'cpu'
 
-        # torch_device is renamed from torch.device to avoid name conflict
-        _model = _model.to(torch_device(device))
+        _model = _model.to(torch.device(target_device))
 
         return cls(_model)
 
