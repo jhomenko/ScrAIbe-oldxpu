@@ -283,10 +283,10 @@ class Diariser:
                              'or your local model path')
         
         # Determine the device to use
-        if torch.cuda.is_available() and device == 'cuda':
-            target_device = 'cuda'
-        elif hasattr(torch, 'xpu') and torch.xpu.is_available():
+        if hasattr(torch, 'xpu') and torch.xpu.is_available():
             target_device = 'xpu'
+        elif torch.cuda.is_available() and device == 'cuda':
+            target_device = 'cuda'
         else:
             target_device = device if device is not None else 'cpu'
 

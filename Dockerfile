@@ -14,6 +14,7 @@ ENV TRANSFORMERS_CACHE=/app/models
 ENV HF_HOME=/app/models
 ENV AUTOT_CACHE=/app/models
 ENV PYANNOTE_CACHE=/app/models/pyannote
+ARG HF_TOKEN
 
 # Installing system dependencies, including ffmpeg for audio processing
 RUN apt-get update && \
@@ -30,7 +31,7 @@ RUN apt-get update && \
     wget -O- https://apt.repos.intel.com/intel-gpg-keys/GPG-PUB-KEY-INTEL-SW-PRODUCTS.PUB | gpg --dearmor | tee /usr/share/keyrings/oneapi-archive-keyring.gpg > /dev/null && \
     echo "deb [signed-by=/usr/share/keyrings/oneapi-archive-keyring.gpg] https://apt.repos.intel.com/oneapi all main" | tee /etc/apt/sources.list.d/oneAPI.list && \
     apt update && \
-    apt install -y intel-openmp libtbb2 && \
+    apt install -y intel-oneapi-runtime-tbb && \
     apt clean && \
     rm -rf /var/lib/apt/lists/*
 
@@ -41,6 +42,10 @@ COPY scraibe /app/scraibe
 
 # Install Python dependencies using pip
 RUN pip install --no-cache-dir -r requirements.txt
+
+# Download the "medium" Whisper model from Hugging Face
+RUN --mount=type=secret,id=hf_token \
+    python3 -c "from huggingface_hub import hf_hub_download; import os; token = open('/run/secrets/hf_token').read(); hf_hub_download(repo_id='openai/whisper-medium', filename='pytorch_model.bin', cache_dir='/app/models', token=token)"
 
 # Final stage
 # Use a smaller base image for the final runtime

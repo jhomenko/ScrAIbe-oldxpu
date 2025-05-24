@@ -7,7 +7,6 @@ output formats, and other options necessary for transcription.
 import os
 import json
 from argparse import ArgumentParser, ArgumentDefaultsHelpFormatter
-from whisper.tokenizer import LANGUAGES, TO_LANGUAGE_CODE
 from torch.cuda import is_available
 from .autotranscript import Scraibe
 from .misc import set_threads
@@ -52,7 +51,7 @@ def cli():
                         help="HuggingFace token for private model download.")
 
     parser.add_argument("--inference-device",
-                        default="cuda" if is_available() else "cpu",
+                        default="xpu" if is_available() else "cpu",
                         help="Device to use for PyTorch inference.")
 
     parser.add_argument("--num-threads", type=int, default=None,
