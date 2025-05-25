@@ -1,0 +1,21 @@
+
+services:
+  scraibe:
+    image: scraibe-xpu:latest
+    container_name: scraibe_xpu
+    #    entrypoint: [ "tail", "-f", "/dev/null" ]
+    #    command: []  # prevent auto-launch of WebUI
+    volumes:
+        - /tmp:/data
+    devices:
+        - /dev/dri:/dev/dri
+    environment:
+        - SCRAIBE_TORCH_DEVICE=xpu
+        - SYCL_DEVICE_FILTER=level_zero:gpu
+        - HF_TOKEN=${HF_TOKEN}
+        - IPEX_XPU_ONEDNN_LAYOUT=1
+        - LIBVA_DRIVER_NAME=iHD
+        - AUTOT_CACHE=/data/models/
+    restart: unless-stopped
+    env_file:
+      - .env
