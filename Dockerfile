@@ -44,10 +44,8 @@ COPY scraibe /app/scraibe
 RUN pip install --no-cache-dir -r requirements.txt
 
 # Download default model from huggingface using the HF_TOKEN environment variable
-RUN python3 -c "\
-  from huggingface_hub import hf_hub_download; \
-  import os; \
-  hf_hub_download(repo_id='openai/whisper-medium', filename='pytorch_model.bin', cache_dir='/app/models', token=os.environ['HF_TOKEN'])"
+ARG HF_TOKEN
+RUN python3 -c "from huggingface_hub import hf_hub_download; import os; hf_hub_download(repo_id='openai/whisper-medium', filename='pytorch_model.bin', cache_dir='/app/models', token=os.environ['HF_TOKEN'])"
 
 # If you prefer using a secret  Download the "medium" Whisper model from Hugging Face
 #RUN --mount=type=secret,id=hf_token \
