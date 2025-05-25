@@ -81,7 +81,7 @@ COPY --from=builder /app/models /app/models
 
 # Install runtime dependencies in the final stage
 RUN apt-get update && \
-    apt-get install -y libsm6 libxrender1 libfontconfig1 ffmpeg && \
+    apt-get install -y python3 python3-pip libsm6 libxrender1 libfontconfig1 ffmpeg && \
     apt-get clean && \
     rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/*
 
