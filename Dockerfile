@@ -3,9 +3,6 @@ ARG HF_TOKEN
 # Builder stage
 FROM intel/intel-extension-for-pytorch:2.7.10-xpu as builder
 
-# Make the build argument available as an environment variable
-ENV HF_TOKEN=${HF_TOKEN}
-
 # Labels
 # Labels will be in the final stage
 
