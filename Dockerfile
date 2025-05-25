@@ -38,6 +38,7 @@ RUN apt-get update && \
 # Copy all necessary files
 COPY requirements.txt /app/requirements.txt
 COPY README.md /app/README.md
+COPY LICENSE /app/LICENSE
 COPY scraibe /app/scraibe
 
 # Install Python dependencies using pip
@@ -68,9 +69,24 @@ LABEL url="https://github.com/JSchmie/ScrAIbe"
 # Copy necessary files from the builder stage
 WORKDIR /app
 
-# Copy installed Python packages from the builder
-COPY --from=builder /usr/local/lib/python*/dist-packages /usr/local/lib/python/dist-packages
-COPY --from=builder /usr/local/bin /usr/local/bin
+# Install runtime dependencies in the final stage
+RUN apt-get update && \
+    apt-get install -y python3 python3-pip libsm6 libxrender1 libfontconfig1 ffmpeg && \
+    apt-get clean && \
+    rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/*
+
+# Note - Was not working once built Copy installed Python packages from the builder
+# COPY --from=builder /usr/local/lib/python*/dist-packages /usr/local/lib/python/dist-packages
+# COPY --from=builder /usr/local/bin /usr/local/bin
+
+COPY requirements.txt /app/requirements.txt
+COPY pyproject.toml poetry.lock* /app/
+COPY LICENSE /app/LICENSE
+COPY README.md /app/README.md
+COPY scraibe /app/scraibe
+
+RUN pip install --no-cache-dir -r requirements.txt && \
+    pip install .
 
 # Copy your application code and other necessary files
 COPY --from=builder /app/scraibe /app/scraibe
@@ -79,11 +95,5 @@ COPY --from=builder /app/README.md /app/README.md
 # Copy models if they are downloaded during the build (adjust path if necessary)
 COPY --from=builder /app/models /app/models
 
-# Install runtime dependencies in the final stage
-RUN apt-get update && \
-    apt-get install -y python3 python3-pip libsm6 libxrender1 libfontconfig1 ffmpeg && \
-    apt-get clean && \
-    rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/*
-
 # Set environment variables
-ENTRYPOINT ["python3", "-m", "scraibe.cli"]
+ENTRYPOINT ["scraibe"]

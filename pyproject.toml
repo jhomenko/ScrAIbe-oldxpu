@@ -1,6 +1,6 @@
 [build-system]
-requires = ["poetry-core>=1.8.0", "poetry-dynamic-versioning>=1.0.0,<2.0.0"]
-build-backend = "poetry_dynamic_versioning.backend"
+requires = ["poetry-core>=1.8.0"]
+build-backend = "poetry.core.masonry.api"
 
 [tool.poetry]
 name = "scraibe"
@@ -40,20 +40,6 @@ torch = "^2.1.2"
 
 [tool.poetry.group.dev.dependencies]
 pytest = "^8.1.1"
-
-[tool.poetry-dynamic-versioning]
-enable = true
-vcs = "git"
-strict = true
-format-jinja = """
-    {%- if distance == 0 -%}
-        {{ serialize_pep440(base) }}
-    {%- elif branch == 'develop' -%}
-        {{ serialize_pep440(bump_version(base), dev = distance) }}
-    {%- else -%}
-        {{ serialize_pep440(bump_version(base), dev=distance, metadata=[commit]) }}
-    {%- endif -%}
-"""
 
 [tool.poetry.group.docs.dependencies]
 sphinx = "^7.3.7"
