@@ -30,7 +30,7 @@ Usage:
 import warnings
 import os
 import yaml
-from pathlib import Path
+from pathlib import Pathfrom typing import Optional
 from typing import TypeVar, Union
 
 from pyannote.audio import Pipeline

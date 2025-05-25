@@ -1,6 +1,5 @@
 # Builder stage
 FROM intel/intel-extension-for-pytorch:2.7.10-xpu as builder
-
 # Labels
 # Labels will be in the final stage
 
