@@ -49,7 +49,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 # Download the "medium" Whisper model from Hugging Face
 RUN python3 -c "from huggingface_hub import hf_hub_download; import os; token = os.environ['HF_TOKEN']; hf_hub_download(repo_id='openai/whisper-medium', filename='pytorch_model.bin', cache_dir='/app/models', token=token)"
-
+RUN python3 -c "import sys, os; from huggingface_hub import hf_hub_download; token = sys.argv[1]; hf_hub_download(repo_id='openai/whisper-medium', filename='pytorch_model.bin', cache_dir='/app/models', token=token)" "${HF_TOKEN}"
 # Final stage
 # Use a smaller base image for the final runtime
 FROM ubuntu:jammy
