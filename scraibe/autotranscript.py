@@ -28,7 +28,7 @@ import os
 from glob import iglob
 import tempfile
 from subprocess import run
-from typing import TypeVar, Union
+from typing import TypeVar, Union, Optional
 from warnings import warn
 
 # Third-Party Imports
@@ -38,7 +38,7 @@ import torchaudio
 
 # Application-Specific Imports
 from .audio import AudioProcessor
-from .diarisation import Diariser
+from .diarisation import Diariser, DiarisationType
 from .transcriber import Transcriber, load_transcriber, whisper
 from .transcript_exporter import Transcript
 from .misc import SCRAIBE_TORCH_DEVICE
@@ -69,7 +69,12 @@ class Scraibe:
                  whisper_model: Union[bool, str, whisper] = None,
                  whisper_type: str = "whisper",
                  dia_model: Union[bool, str, DiarisationType] = None,
-                 **kwargs) -> None:
+                 flash: bool = False,
+                 timestamp: str = 'chunk',
+                 min_speakers: Optional[int] = None,
+                 max_speakers: Optional[int] = None,
+                 inference_device: str = SCRAIBE_TORCH_DEVICE,
+                 **kwargs) -> None: # Removed inference_device from kwargs as it's now a named parameter
         """Initializes the Scraibe class.
 
         Args:
@@ -80,14 +85,33 @@ class Scraibe:
             diarisation_model (Union[bool, str, DiarisationType], optional): 
                                 Path to pyannote diarization model or model itself.
             **kwargs: Additional keyword arguments for whisper
-                        and pyannote diarization models.
-                    e.g.:
+                        and pyannote diarization models (excluding inference_device).
+            flash (bool, optional): Enable Flash Attention 2 for InsanelyFastWhisper. Defaults to False.
+            timestamp (str, optional): Timestamp level for InsanelyFastWhisper ('chunk' or 'word'). Defaults to 'chunk'.
+            min_speakers (Optional[int], optional): Minimum number of speakers for InsanelyFastWhisper diarization. Defaults to None.
+            max_speakers (Optional[int], optional): Maximum number of speakers for InsanelyFastWhisper diarization. Defaults to None.
+            inference_device (str, optional): Device to use for PyTorch inference. Defaults to SCRAIBE_TORCH_DEVICE.
 
-                    - verbose: If True, the class will print additional information.
-                    - save_kwargs: If True, the keyword arguments will be saved
-                                    for autotranscribe. So you can unload the class and reload it again.
+        e.g.:
+            - verbose: If True, the class will print additional information.
+            - save_kwargs: If True, the keyword arguments will be saved
+                            for autotranscribe. So you can unload the class and reload it again.
         """
 
+        self.flash = flash
+        self.timestamp = timestamp
+        self.min_speakers = min_speakers
+        self.max_speakers = max_speakers
+        self.inference_device = inference_device # Store inference_device as an attribute
+        self.use_auth_token = kwargs.get('use_auth_token') # Get hf_token from kwargs
+
+        # Handle cases where inference_device might still be in kwargs from older cli versions
+        # Remove it to avoid passing it twice if the new cli is not used.
+        if 'inference_device' in kwargs:
+            warn("Passing 'inference_device' as a keyword argument is deprecated. Use the named parameter instead.", DeprecationWarning)
+            kwargs.pop('inference_device')
+
+        # Transcriber initialization
         if whisper_model is None:
             self.transcriber = load_transcriber(
                 "medium", whisper_type, **kwargs)
@@ -96,6 +120,20 @@ class Scraibe:
                 whisper_model, whisper_type, **kwargs)
         else:
             self.transcriber = whisper_model
+        
+        # Add elif for insanely-fast-whisper
+        elif whisper_type == "insanely-fast-whisper":
+            from .transcriber import InsanelyFastWhisperTranscriber # Import here to avoid circular dependency if not used
+            self.transcriber = InsanelyFastWhisperTranscriber(
+                model=self.whisper_model, # Use the model name from cli
+                device=self.inference_device, # Use the stored inference_device
+                flash=self.flash,
+                timestamp=self.timestamp,
+                hf_token=self.use_auth_token,
+                min_speakers=self.min_speakers,
+                max_speakers=self.max_speakers,
+                **kwargs # Pass remaining kwargs
+            )
 
         if dia_model is None:
             self.diariser = Diariser.load_model(**kwargs)
@@ -116,8 +154,6 @@ class Scraibe:
                                dia_model=dia_model,
                                **kwargs)
         else:
-            self.params = {}
-            
         self.device = kwargs.get(
             "device", SCRAIBE_TORCH_DEVICE)
 

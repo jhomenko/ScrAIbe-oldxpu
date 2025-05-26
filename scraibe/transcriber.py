@@ -16,9 +16,13 @@ Main Features:
     
 Constants:
     WHISPER_DEFAULT_PATH: Default path for downloading and loading Whisper models.
+"""
 
-Usage:
-    >>> from your_package import Transcriber
+import subprocess
+import json
+import os
+import tempfile
+
     >>> transcriber = Transcriber.load_model(model="medium")
     >>> transcript = transcriber.transcribe(audio="path/to/audio.wav")
     >>> transcriber.save_transcript(transcript, "path/to/save.txt")
@@ -29,7 +33,6 @@ from whisper import load_model as whisper_load_model
 from whisper.tokenizer import TO_LANGUAGE_CODE
 from faster_whisper import WhisperModel as FasterWhisperModel
 from faster_whisper.tokenizer import _LANGUAGE_CODES as FASTER_WHISPER_LANGUAGE_CODES
-from insanely_fast_whisper import WhisperModel as InsanelyFastWhisperModel
 from typing import TypeVar, Union, Optional
 from torch import Tensor, device
 from numpy import ndarray
@@ -416,8 +419,35 @@ class FasterWhisperTranscriber(Transcriber):
 
 
 class InsanelyFastWhisperTranscriber(Transcriber):
-    def __init__(self, model: whisper, model_name: str) -> None:
-        super().__init__(model, model_name)
+    """
+    Transcriber Class for Insanely Fast Whisper CLI.
+
+    This class wraps the functionality of the insanely-fast-whisper command-line
+    tool, executing it via subprocess to perform audio transcription.
+    """
+    def __init__(self, model: str, device: str, flash: bool = False,
+                 timestamp: str = 'chunk', hf_token: Optional[str] = None,
+                 min_speakers: Optional[int] = None, max_speakers: Optional[int] = None) -> None:
+        """
+        Initialize the InsanelyFastWhisperTranscriber with specified parameters.
+
+        Args:
+            model (str): Name of the Whisper model to use.
+            device (str): Device to use for inference (e.g., "0" for CUDA, "mps" for Mac).
+            flash (bool, optional): Whether to use Flash Attention 2. Defaults to False.
+            timestamp (str, optional): Timestamp level ('chunk' or 'word'). Defaults to 'chunk'.
+            hf_token (Optional[str], optional): Hugging Face token for diarization. Defaults to None.
+            min_speakers (Optional[int], optional): Minimum number of speakers for diarization. Defaults to None.
+            max_speakers (Optional[int], optional): Maximum number of speakers for diarization. Defaults to None.
+        """
+        # The 'model' attribute is the model name string for this class
+        self.model = model
+        self.device = device
+        self.flash = flash
+        self.timestamp = timestamp
+        self.hf_token = hf_token
+        self.min_speakers = min_speakers
+        self.max_speakers = max_speakers
 
     def transcribe(self, audio: Union[str, Tensor, ndarray],
                    *args, **kwargs) -> str:
@@ -425,69 +455,93 @@ class InsanelyFastWhisperTranscriber(Transcriber):
         Transcribe an audio file using Insanely Fast Whisper.
 
         Args:
-            audio (Union[str, Tensor, nparray]): The audio file to transcribe.
+            audio (Union[str, Tensor, ndarray]): The audio file path to transcribe.
             *args: Additional arguments.
             **kwargs: Additional keyword arguments.
 
         Returns:
-            str: The transcript as a string.
+            dict: The transcription results as a dictionary (parsed from JSON output).
         """
-        kwargs = self._get_whisper_kwargs(**kwargs)
+        if not isinstance(audio, str):
+             raise TypeError("Insanely Fast Whisper transcriber requires an audio file path (string).")
 
-        # Insanely Fast Whisper transcribe expects a file path or URL
-        if isinstance(audio, (Tensor, ndarray)):
-             raise TypeError("Insanely Fast Whisper only supports file paths or URLs for transcription.")
+        # Create a temporary file for the output JSON
+        with tempfile.NamedTemporaryFile(mode='w+', suffix='.json', delete=False) as tmp_file:
+            output_path = tmp_file.name
 
-        result = self.model.transcribe(audio, *args, **kwargs)
-        return result["text"]
+        command = [
+            'insanely-fast-whisper',
+            '--file-name', audio,
+            '--model-name', self.model,
+            '--device-id', self.device,
+            '--transcript-path', output_path,
+            '--timestamp', self.timestamp
+        ]
+
+        if self.flash:
+            command.append('--flash')
+
+        # Note: We are not adding diarization arguments here as we decided to use ScrAIbe's internal diarization
+
+        try:
+            # Execute the command
+            result = subprocess.run(command, check=True, capture_output=True, text=True)
+            # Read and parse the output JSON
+            with open(output_path, 'r') as f:
+                transcription_data = json.load(f)
+        except subprocess.CalledProcessError as e:
+            print(f"Error executing insanely-fast-whisper: {e}")
+            print(f"Stderr: {e.stderr}")
+            raise
+        finally:
+            # Clean up the temporary file
+            if os.path.exists(output_path):
+                os.remove(output_path)
+
+        # The format of the returned data depends on insanely-fast-whisper's output.
+        # We assume it's a dictionary containing the transcription results.
+        # You might need to adjust this part based on the actual output structure
+        # to make it compatible with ScrAIbe's expected format (e.g., list of segments).
+        return transcription_data
 
     @classmethod
     def load_model(cls,
                    model: str = "medium",
                    download_root: str = WHISPER_DEFAULT_PATH,
                    device: Optional[Union[str, device]] = SCRAIBE_TORCH_DEVICE,
-                   *args, **kwargs
+                   flash: bool = False,
+                   timestamp: str = 'chunk',
+                   hf_token: Optional[str] = None,
+                   min_speakers: Optional[int] = None,
+                   max_speakers: Optional[int] = None,
+                   *args, **kwargs # Catch any extra args
                    ) -> 'InsanelyFastWhisperTranscriber':
         """
         Load Insanely Fast Whisper model.
 
         Args:
             model (str): Whisper model. Available models include:
-                        - 'tiny.en'
-                        - 'tiny'
-                        - 'base.en'
-                        - 'base'
-                        - 'small.en'
-                        - 'small'
-                        - 'medium.en'
-                        - 'medium'
-                        - 'large-v1'
-                        - 'large-v2'
-                        - 'large-v3'
-                        - 'large'
-
-            download_root (str, optional): Path to download the model.
-                                            Defaults to WHISPER_DEFAULT_PATH.
-
             device (Optional[Union[str, torch.device]], optional):
                                         Device to load model on. Defaults to SCRAIBE_TORCH_DEVICE.
-            args: Additional arguments only to avoid errors.
-            kwargs: Additional keyword arguments only to avoid errors.
+            flash (bool, optional): Whether to use Flash Attention 2. Defaults to False.
+            timestamp (str, optional): Timestamp level ('chunk' or 'word'). Defaults to 'chunk'.
+            hf_token (Optional[str], optional): Hugging Face token for diarization. Defaults to None.
+            min_speakers (Optional[int], optional): Minimum number of speakers for diarization. Defaults to None.
+            max_speakers (Optional[int], optional): Maximum number of speakers for diarization. Defaults to None.
 
         Returns:
             Transcriber: A Transcriber object initialized with the specified model.
         """
         # Insanely Fast Whisper uses the device string directly
         if device is None:
-             device = "xpu" if torch.xpu.is_available() else SCRAIBE_TORCH_DEVICE
+             # Assuming torch is imported elsewhere and xpu availability is checked
+             device = "xpu" if hasattr(torch, 'xpu') and torch.xpu.is_available() else SCRAIBE_TORCH_DEVICE
 
-        _model = InsanelyFastWhisperModel(model,
-                                         device=str(device),
-                                         cache_dir=download_root, # Use download_root as cache_dir
-                                         **kwargs # Pass any additional kwargs
-                                         )
-
-        return cls(_model, model_name=model)
+        # We don't actually load the model in this class's load_model.
+        # The model is handled by the subprocess call in transcribe.
+        # We just instantiate the transcriber with the config.
+        return cls(model=model, device=str(device), flash=flash, timestamp=timestamp,
+                   hf_token=hf_token, min_speakers=min_speakers, max_speakers=max_speakers)
 
     @staticmethod
     def _get_whisper_kwargs(**kwargs) -> dict:

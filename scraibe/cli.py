@@ -47,6 +47,18 @@ def cli():
     parser.add_argument("--diarization-directory", type=str, default=None,
                         help="Path to the diarization model directory.")
 
+    parser.add_argument("--flash", type=str2bool, default=False,
+                        help="Enable Flash Attention 2 for insanely-fast-whisper.")
+
+    parser.add_argument("--timestamp", type=str, default="chunk",
+                        choices=["chunk", "word"],
+                        help="Timestamp level for transcription (chunk or word).")
+
+    parser.add_argument("--min-speakers", type=int, default=None,
+                        help="Minimum number of speakers for diarization.")
+
+    parser.add_argument("--max-speakers", type=int, default=None,
+                        help="Maximum number of speakers for diarization.")
     parser.add_argument("--hf-token", default=None, type=str,
                         help="HuggingFace token for private model download.")
 
