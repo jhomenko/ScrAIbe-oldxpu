@@ -17,16 +17,16 @@ Main Features:
 Constants:
     WHISPER_DEFAULT_PATH: Default path for downloading and loading Whisper models.
 """
-
+"""
+Example Usage:
+>>> transcriber = Transcriber.load_model(model="medium")
+>>> transcript = transcriber.transcribe(audio="path/to/audio.wav")
+>>> transcriber.save_transcript(transcript, "path/to/save.txt")
+"""
 import subprocess
 import json
 import os
 import tempfile
-
-    >>> transcriber = Transcriber.load_model(model="medium")
-    >>> transcript = transcriber.transcribe(audio="path/to/audio.wav")
-    >>> transcriber.save_transcript(transcript, "path/to/save.txt")
-"""
 
 from whisper import Whisper
 from whisper import load_model as whisper_load_model
