@@ -65,17 +65,9 @@ LABEL description="Scraibe is a tool for automatic speech recognition and speake
                     It is designed to be used with the Whisper model, a lightweight model for automatic \
                     speech recognition and speaker diarization."
 LABEL url="https://github.com/JSchmie/ScrAIbe"
-ARG IPEX_VERSION=2.7.0
-ARG TORCHCCL_VERSION=2.7.0
-ARG PYTORCH_VERSION=2.7.0
-ARG TORCHAUDIO_VERSION=2.7.0
-ARG TORCHVISION_VERSION=0.22.0
 
-# Install PyTorch and Intel Extension for PyTorch within the virtual environment
+# We will use the host's oneAPI installation, so remove internal PyTorch/IPEX installation
 RUN . /app/venv/bin/activate && \
-    pip install --no-cache-dir torch==2.7.0+cpu torchvision==0.22.0+cpu torchaudio==2.7.0+cpu --index-url https://download.pytorch.org/whl/cpu && \
-    pip install --no-cache-dir intel_extension_for_pytorch==2.7.0 oneccl_bind_pt==2.7.0 --extra-index-url https://pytorch-extension.intel.com/release-whl/stable/cpu/us/ && \
-    pip install intel-openmp && \
     pip install --no-cache-dir -r requirements.txt
 
 # Install ScrAIbe itself within the virtual environment
@@ -91,3 +83,6 @@ RUN . /app/venv/bin/activate && \
 # Entrypoint script will activate the venv and source setvars.sh
 # The custom docker-entrypoint.sh will be modified to handle this
 ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]
+
+# Declare /opt/intel/oneapi as a volume to be mounted from the host
+VOLUME /opt/intel/oneapi

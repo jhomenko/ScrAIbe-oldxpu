@@ -4,6 +4,7 @@ allowing for user interaction to transcribe and diarize audio files.
 The function includes arguments for specifying the audio files, model paths,
 output formats, and other options necessary for transcription.
 """
+from whisper.tokenizer import LANGUAGES, TO_LANGUAGE_CODE
 import os
 import json
 import torch

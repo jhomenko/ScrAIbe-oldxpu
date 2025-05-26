@@ -1,7 +1,7 @@
 #!/bin/bash
 
     # Source the setvars.sh script
-    source /opt/intel/setvars.sh
+    source /opt/intel/oneapi/setvars.sh
 
     # Execute the original command
     exec "$@"
