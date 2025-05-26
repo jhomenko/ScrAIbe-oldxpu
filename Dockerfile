@@ -38,22 +38,25 @@ RUN apt-get update && \
     rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/*
 
 # Add Intel repositories and install graphics drivers, compute runtime, and Level Zero Loader
+# Install dependencies and configure the environment
 RUN set -eux && \
     apt-get update && \
-    apt-get install -y --no-install-recommends gnupg software-properties-common && \
+    #
+    # Update and install basic dependencies and prerequisites for Intel repo
+    apt-get install -y --no-install-recommends \
+      curl git sudo libunwind8-dev vim less gnupg gpg-agent software-properties-common wget && \
     \
-    wget -O- https://apt.repos.intel.com/intel-gpg-keys/GPG-PUB-KEY-INTEL-SW-PRODUCTS.PUB | gpg --dearmor -o /usr/share/keyrings/intel-oneapi-archive-keyring.gpg && \
-    echo "deb [signed-by=/usr/share/keyrings/intel-oneapi-archive-keyring.gpg] https://apt.repos.intel.com/oneapi all main" | tee /etc/apt/sources.list.d/oneAPI.list && \
-    rm -f /etc/apt/sources.list.d/intel-graphics.list && \
-    wget -O- https://repositories.intel.com/graphics/intel-graphics.key | gpg --dearmor -o /usr/share/keyrings/intel-graphics.gpg && \
-    echo "deb [arch=amd64 signed-by=/usr/share/keyrings/intel-graphics.gpg] https://repositories.intel.com/graphics/ubuntu jammy arc" | tee /etc/apt/sources.list.d/intel.gpu.jammy.list && \
+    # Add Intel GPU repository and key
+    wget -qO - https://repositories.intel.com/gpu/intel-graphics.key | \
+        gpg --dearmor --output /usr/share/keyrings/intel-graphics.gpg && \
+    echo "deb [arch=amd64 signed-by=/usr/share/keyrings/intel-graphics.gpg] https://repositories.intel.com/gpu/ubuntu jammy/lts/2350 unified" | \
+        tee /etc/apt/sources.list.d/intel-gpu-jammy.list && \
     \
     apt-get update && \
     apt-get install -y --no-install-recommends \
         intel-opencl-icd \
         intel-level-zero-gpu \
-        level-zero \
-        level-zero-devel && \
+        level-zero && \
     \
     # Clean up apt cache
     apt-get clean && \
