@@ -10,6 +10,7 @@ services:
     devices:
       - /dev/dri:/dev/dri
     environment:
+      - LD_LIBRARY_PATH=/opt/intel/oneapi/compiler/latest/lib/x64:/opt/intel/oneapi/mkl/latest/lib/x64:/opt/intel/oneapi/tbb/latest/lib/x64
       - SCRAIBE_TORCH_DEVICE=xpu
       - SYCL_DEVICE_FILTER=level_zero:gpu
       - HF_TOKEN=${HF_TOKEN}

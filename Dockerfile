@@ -37,6 +37,30 @@ RUN apt-get update && \
     apt clean && \
     rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/*
 
+# Add Intel repositories and install graphics drivers, compute runtime, and Level Zero Loader
+RUN set -eux && \
+    wget -O- https://apt.repos.intel.com/intel-gpg-keys/GPG-PUB-KEY-INTEL-SW-PRODUCTS.PUB | gpg --dearmor | tee /usr/share/keyrings/intel-oneapi-archive-keyring.gpg > /dev/null && \
+    echo "deb [signed-by=/usr/share/keyrings/intel-oneapi-archive-keyring.gpg] https://apt.repos.intel.com/oneapi all main" | tee /etc/apt/sources.list.d/oneAPI.list && \
+    chmod 644 /usr/share/keyrings/intel-oneapi-archive-keyring.gpg && \
+    rm -f /etc/apt/sources.list.d/intel-graphics.list && \
+    wget -O- https://repositories.intel.com/graphics/intel-graphics.key | gpg --dearmor | tee /usr/share/keyrings/intel-graphics.gpg > /dev/null && \
+    echo "deb [arch=amd64 signed-by=/usr/share/keyrings/intel-graphics.gpg] https://repositories.intel.com/graphics/ubuntu jammy arc" | tee /etc/apt/sources.list.d/intel.gpu.jammy.list && \
+    chmod 644 /usr/share/keyrings/intel-graphics.gpg && \
+    \
+    apt-get update && \
+    apt-get install -y --no-install-recommends \
+        intel-opencl-icd \
+        intel-level-zero-gpu \
+        level-zero \
+        level-zero-devel && \
+    \
+    # Clean up apt cache
+    apt-get clean && \
+    rm -rf /var/lib/apt/lists/*
+
+# Remove the conflicting statement about using host's oneAPI as we are installing drivers in the image
+# We will use the host's oneAPI installation for the toolkit, but drivers are in the image
+
 # Create and activate Python virtual environment early
 RUN python3 -m venv /app/venv && \
     . /app/venv/bin/activate && \
@@ -63,8 +87,15 @@ LABEL version="0.1.1.dev"
 LABEL description="Scraibe is a tool for automatic speech recognition and speaker diarization. \
                     It is based on the Hugging Face Transformers library and the Pyannote library. \
                     It is designed to be used with the Whisper model, a lightweight model for automatic \
-                    speech recognition and speaker diarization."
+                    speech recognition and speaker diarization." \
 LABEL url="https://github.com/JSchmie/ScrAIbe"
+
+# Update PyTorch and IPEX installation to use XPU wheels and correct versions
+RUN . /app/venv/bin/activate && \
+    pip install --no-cache-dir \
+    torch==2.7.0 torchaudio==2.7.0 --index-url https://download.pytorch.org/whl/xpu && \
+    pip install --no-cache-dir \
+    intel-extension-for-pytorch==2.7.10+xpu oneccl-bind-pt==2.7.0+xpu --extra-index-url https://pytorch-extension.intel.com/release-whl/stable/xpu/us/
 
 # We will use the host's oneAPI installation, so remove internal PyTorch/IPEX installation
 RUN . /app/venv/bin/activate && \
@@ -83,6 +114,10 @@ RUN . /app/venv/bin/activate && \
 # Entrypoint script will activate the venv and source setvars.sh
 # The custom docker-entrypoint.sh will be modified to handle this
 ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]
+# Modify the docker-entrypoint.sh script
+RUN sed -i '/source \/app\/venv\/lib\/python3.\/site-packages\/torch\/lib\/..\/..\/..\/..\/oneccl_bindings_for_pytorch\/env\/setvars.sh/d' /usr/local/bin/docker-entrypoint.sh && \
+    sed -i '/# Ensure the oneAPI environment is sourced/i # Ensure the oneAPI environment is sourced\nsource \/opt\/intel\/oneapi\/setvars.sh || true\n\n# Activate the virtual environment\nsource \/app\/venv\/bin\/activate' /usr/local/bin/docker-entrypoint.sh
+
 
 # Declare /opt/intel/oneapi as a volume to be mounted from the host
 VOLUME /opt/intel/oneapi
