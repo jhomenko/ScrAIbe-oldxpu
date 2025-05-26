@@ -1,60 +1,60 @@
-# Builder stage
-FROM intel/intel-extension-for-pytorch:2.7.10-xpu as builder
+# Copyright (c) 2024 Jacob Schmieder
+# SPDX-License-Identifier: Apache 2.0
 
-# Labels
-# Labels will be in the final stage
+# NOTE: To build this you will need a docker version >= 19.03 and DOCKER_BUILDKIT=1
+#
+#       If you do not use buildkit you are not going to have a good time
+#
+#       For reference:
+#           https://docs.docker.com/develop/develop-images/build_enhancements/
+
+ARG UBUNTU_VERSION=22.04
+
+FROM ubuntu:${UBUNTU_VERSION}
+
+# See http://bugs.python.org/issue19846
+ENV LANG C.UTF-8
 
 # Install dependencies
 WORKDIR /app
-#Enviorment dependencies
+
+# Environment dependencies
 ENV SYCL_DEVICE_FILTER=level_zero:gpu
 ENV IPEX_XPU_ONEDNN_LAYOUT=1
 ENV SCRAIBE_TORCH_DEVICE=xpu
 ENV TRANSFORMERS_CACHE=/app/models
 ENV HF_HOME=/app/models
 ENV AUTOT_CACHE=/app/models
-ENV PYANNOTE_CACHE=/app/models/pyannote
+ENV PYANNOTE_CACHE="/app/models/pyannote"
 ARG HF_TOKEN
 
-# Installing system dependencies, including ffmpeg for audio processing
+# Installing system dependencies, including ffmpeg for audio processing, and python venv
 RUN apt-get update && \
     apt-get install -y apt-transport-https ca-certificates curl software-properties-common && \
     apt-key adv --refresh-keys --keyserver hkp://keyserver.ubuntu.com:80 && \
     apt update -y && apt upgrade -y && \
-    apt install -y libsm6 libxrender1 libfontconfig1 ffmpeg && \
+    apt install -y libsm6 libxrender1 libfontconfig1 ffmpeg python3 python3-pip python3-dev python3-venv && \
     apt clean && \
     rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/*
 
-# Set up Intel APT repository and install necessary runtimes
-RUN apt-get update && \
-    apt install -y gpg-agent wget && \
-    wget -O- https://apt.repos.intel.com/intel-gpg-keys/GPG-PUB-KEY-INTEL-SW-PRODUCTS.PUB | gpg --dearmor | tee /usr/share/keyrings/oneapi-archive-keyring.gpg > /dev/null && \
-    echo "deb [signed-by=/usr/share/keyrings/oneapi-archive-keyring.gpg] https://apt.repos.intel.com/oneapi all main" | tee /etc/apt/sources.list.d/oneAPI.list && \
-    apt update && \
-    apt install -y intel-oneapi-runtime-tbb && \
-    apt clean && \
-    rm -rf /var/lib/apt/lists/*
+# Create and activate Python virtual environment early
+RUN python3 -m venv /app/venv && \
+    . /app/venv/bin/activate && \
+    python -m pip --no-cache-dir install --upgrade pip setuptools psutil
 
-# Copy all necessary files
+# Set PATH to use the virtual environment's bin directory by default
+ENV PATH="/app/venv/bin:$PATH"
+
+# Copy application files and requirements
 COPY requirements.txt /app/requirements.txt
 COPY README.md /app/README.md
 COPY LICENSE /app/LICENSE
 COPY scraibe /app/scraibe
+COPY pyproject.toml poetry.lock* /app/
+COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
+RUN chmod +x /usr/local/bin/docker-entrypoint.sh
 
-# Install Python dependencies using pip
-RUN pip install --no-cache-dir -r requirements.txt
-
-# Download default model from huggingface using the HF_TOKEN environment variable
-ARG HF_TOKEN
-RUN python3 -c "from huggingface_hub import hf_hub_download; import os; hf_hub_download(repo_id='openai/whisper-medium', filename='pytorch_model.bin', cache_dir='/app/models', token=os.environ['HF_TOKEN'])"
-
-# If you prefer using a secret  Download the "medium" Whisper model from Hugging Face
-#RUN --mount=type=secret,id=hf_token \
-#    python3 -c "from huggingface_hub import hf_hub_download; import os; token = open('/run/secrets/hf_token').read(); hf_hub_download(repo_id='openai/whisper-medium', filename='pytorch_model.bin', cache_dir='/app/models', token=token)"
-
-# Final stage
-# Use a smaller base image for the final runtime
-FROM ubuntu:jammy
+# Labels (moved to the final stage)
 
 # Labels (move labels to the final stage)
 LABEL maintainer="Jacob Schmieder"
@@ -65,49 +65,29 @@ LABEL description="Scraibe is a tool for automatic speech recognition and speake
                     It is designed to be used with the Whisper model, a lightweight model for automatic \
                     speech recognition and speaker diarization."
 LABEL url="https://github.com/JSchmie/ScrAIbe"
+ARG IPEX_VERSION=2.7.0
+ARG TORCHCCL_VERSION=2.7.0
+ARG PYTORCH_VERSION=2.7.0
+ARG TORCHAUDIO_VERSION=2.7.0
+ARG TORCHVISION_VERSION=0.22.0
 
-# Copy necessary files from the builder stage
-WORKDIR /app
-
-# Install runtime dependencies and Python virtual environment
-RUN apt-get update && \
-    apt-get install -y --no-install-recommends \
-    python3 \
-    python3-pip \
-    python3-dev \
-    python3-venv \
-    libsm6 libxrender1 libfontconfig1 ffmpeg && \
-    apt-get clean && \
-    rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/*
-
-# Create and activate Python virtual environment
-RUN python3 -m venv /app/venv
-# Set PATH to use the virtual environment's bin directory
-ENV PATH="/app/venv/bin:$PATH"
-
-COPY requirements.txt /app/requirements.txt
-COPY pyproject.toml poetry.lock* /app/
-COPY LICENSE /app/LICENSE
-COPY README.md /app/README.md
-
-# Install Python dependencies using pip within the virtual environment
-RUN pip install --no-cache-dir --upgrade pip setuptools psutil && \
+# Install PyTorch and Intel Extension for PyTorch within the virtual environment
+RUN . /app/venv/bin/activate && \
     pip install --no-cache-dir torch==2.7.0+cpu torchvision==0.22.0+cpu torchaudio==2.7.0+cpu --index-url https://download.pytorch.org/whl/cpu && \
-    pip install --no-cache-dir intel_extension_for_pytorch==2.7.10 oneccl_bind_pt==2.7.0 --extra-index-url https://pytorch-extension.intel.com/release-whl/stable/cpu/us/ && \
+    pip install --no-cache-dir intel_extension_for_pytorch==2.7.0 oneccl_bind_pt==2.7.0 --extra-index-url https://pytorch-extension.intel.com/release-whl/stable/cpu/us/ && \
     pip install intel-openmp && \
-    pip install --no-cache-dir -r requirements.txt && \
+    pip install --no-cache-dir -r requirements.txt
+
+# Install ScrAIbe itself within the virtual environment
+RUN . /app/venv/bin/activate && \
     pip install .
 
-# Copy your application code and other necessary files
-COPY --from=builder /app/scraibe /app/scraibe
-COPY --from=builder /app/README.md /app/README.md
 
-# Copy models if they are downloaded during the build (adjust path if necessary)
-COPY --from=builder /app/models /app/models
+# Download default model from huggingface using the HF_TOKEN environment variable (will be downloaded inside the container)
+ARG HF_TOKEN
+RUN . /app/venv/bin/activate && \
+    python3 -c "from huggingface_hub import hf_hub_download; import os; hf_hub_download(repo_id='openai/whisper-medium', filename='pytorch_model.bin', cache_dir='/app/models', token=os.environ.get('HF_TOKEN'))"
 
-# Copy setvars.sh from builder and the custom entrypoint script
-COPY --from=builder /usr/local/lib/python3.10/dist-packages/oneccl_bindings_for_pytorch/env/setvars.sh /opt/intel/setvars.sh
-COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
-RUN chmod +x /usr/local/bin/docker-entrypoint.sh
-# Set the custom entrypoint
+# Entrypoint script will activate the venv and source setvars.sh
+# The custom docker-entrypoint.sh will be modified to handle this
 ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]
