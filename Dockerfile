@@ -92,8 +92,8 @@ COPY README.md /app/README.md
 
 # Install Python dependencies using pip within the virtual environment
 RUN pip install --no-cache-dir --upgrade pip setuptools psutil && \
-    pip install --no-cache-dir torch==2.7.10+cpu torchvision==0.22.0+cpu torchaudio==2.7.0+cpu --index-url https://download.pytorch.org/whl/cpu && \
-    pip install --no-cache-dir intel_extension_for_pytorch==2.7.10 oneccl_bind_pt==2.7.10 --extra-index-url https://pytorch-extension.intel.com/release-whl/stable/cpu/us/ && \
+    pip install --no-cache-dir torch==2.7.0+cpu torchvision==0.22.0+cpu torchaudio==2.7.0+cpu --index-url https://download.pytorch.org/whl/cpu && \
+    pip install --no-cache-dir intel_extension_for_pytorch==2.7.10 oneccl_bind_pt==2.7.0 --extra-index-url https://pytorch-extension.intel.com/release-whl/stable/cpu/us/ && \
     pip install intel-openmp && \
     pip install --no-cache-dir -r requirements.txt && \
     pip install .
