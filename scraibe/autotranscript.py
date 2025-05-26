@@ -121,13 +121,13 @@ class Scraibe:
         else:
             self.transcriber = whisper_model
         
-        # Add elif for insanely-fast-whisper
         elif whisper_type == "insanely-fast-whisper":
             from .transcriber import InsanelyFastWhisperTranscriber # Import here to avoid circular dependency if not used
             self.transcriber = InsanelyFastWhisperTranscriber(
-                model=self.whisper_model, # Use the model name from cli
-                device=self.inference_device, # Use the stored inference_device
+                model=whisper_model, # Use the model name passed to __init__
+                device=self.inference_device, # Use the stored inference_device (from args or default)
                 flash=self.flash,
+                download_root=kwargs.get('download_root'), # Pass download_root if present
                 timestamp=self.timestamp,
                 hf_token=self.use_auth_token,
                 min_speakers=self.min_speakers,
@@ -148,12 +148,11 @@ class Scraibe:
         else:
             self.verbose = False
 
-        # Save kwargs for autotranscribe if you want to unload the class and load it again.
-        if kwargs.get('save_setup'):
-            self.params = dict(whisper_model=whisper_model,
-                               dia_model=dia_model,
-                               **kwargs)
-        else:
+        # Store relevant parameters for potential future use or re-initialization
+        self.params = dict(whisper_model=whisper_model,
+                           whisper_type=whisper_type,
+                           dia_model=dia_model,
+                           **kwargs)
         self.device = kwargs.get(
             "device", SCRAIBE_TORCH_DEVICE)
 
