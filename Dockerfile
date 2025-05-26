@@ -58,13 +58,8 @@ RUN set -eux && \
     apt-get clean && \
     rm -rf /var/lib/apt/lists/*
 
-# Remove the conflicting statement about using host's oneAPI as we are installing drivers in the image
-# We will use the host's oneAPI installation for the toolkit, but drivers are in the image
-
 # Create and activate Python virtual environment early
-RUN python3 -m venv /app/venv && \
-    . /app/venv/bin/activate && \
-    python -m pip --no-cache-dir install --upgrade pip setuptools psutil
+RUN python3 -m venv /app/venv &&     . /app/venv/bin/activate &&     python -m pip --no-cache-dir install --upgrade pip setuptools psutil
 
 # Set PATH to use the virtual environment's bin directory by default
 ENV PATH="/app/venv/bin:$PATH"
@@ -78,26 +73,14 @@ COPY pyproject.toml poetry.lock* /app/
 COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
 RUN chmod +x /usr/local/bin/docker-entrypoint.sh
 
-# Labels (moved to the final stage)
-
-# Labels (move labels to the final stage)
 LABEL maintainer="Jacob Schmieder"
 LABEL email="Jacob.Schmieder@dbfz.de"
 LABEL version="0.1.1.dev"
 LABEL description="Scraibe is a tool for automatic speech recognition and speaker diarization. \
                     It is based on the Hugging Face Transformers library and the Pyannote library. \
                     It is designed to be used with the Whisper model, a lightweight model for automatic \
-                    speech recognition and speaker diarization." \
+                    speech recognition and speaker diarization."
 LABEL url="https://github.com/JSchmie/ScrAIbe"
-
-# Update PyTorch and IPEX installation to use XPU wheels and correct versions
-RUN . /app/venv/bin/activate && \
-    pip install --no-cache-dir \
-    torch==2.7.0 torchaudio==2.7.0 --index-url https://download.pytorch.org/whl/xpu && \
-    pip install --no-cache-dir \
-    intel-extension-for-pytorch==2.7.10+xpu oneccl-bind-pt==2.7.0+xpu --extra-index-url https://pytorch-extension.intel.com/release-whl/stable/xpu/us/
-
-# We will use the host's oneAPI installation, so remove internal PyTorch/IPEX installation
 RUN . /app/venv/bin/activate && \
     pip install --no-cache-dir -r requirements.txt
 
