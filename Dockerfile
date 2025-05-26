@@ -96,4 +96,11 @@ COPY --from=builder /app/README.md /app/README.md
 COPY --from=builder /app/models /app/models
 
 # Set environment variables
-ENTRYPOINT ["python3", "-c", "from whisper.tokenizer import LANGUAGES, TO_LANGUAGE_CODE; print('Successfully imported whisper.tokenizer')"]
+ENTRYPOINT ["scraibe"]
+
+# Copy setvars.sh from builder and the custom entrypoint script
+COPY --from=builder /usr/local/lib/python3.10/dist-packages/oneccl_bindings_for_pytorch/env/setvars.sh /opt/intel/setvars.sh
+COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
+RUN chmod +x /usr/local/bin/docker-entrypoint.sh
+# Set the custom entrypoint
+ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]
