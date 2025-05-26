@@ -114,26 +114,30 @@ class Scraibe:
         # Transcriber initialization
         if whisper_model is None:
             self.transcriber = load_transcriber(
-                "medium", whisper_type, **kwargs)
-        elif isinstance(whisper_model, str):
-            self.transcriber = load_transcriber(
-                whisper_model, whisper_type, **kwargs)
-        else:
-            self.transcriber = whisper_model
-        
-        elif whisper_type == "insanely-fast-whisper":
-            from .transcriber import InsanelyFastWhisperTranscriber # Import here to avoid circular dependency if not used
-            self.transcriber = InsanelyFastWhisperTranscriber(
-                model=whisper_model, # Use the model name passed to __init__
-                device=self.inference_device, # Use the stored inference_device (from args or default)
+                model="medium",
+                whisper_type=whisper_type,
                 flash=self.flash,
-                download_root=kwargs.get('download_root'), # Pass download_root if present
                 timestamp=self.timestamp,
-                hf_token=self.use_auth_token,
                 min_speakers=self.min_speakers,
                 max_speakers=self.max_speakers,
-                **kwargs # Pass remaining kwargs
+                device=self.inference_device, # Note: load_transcriber expects 'device', not 'inference_device'
+                hf_token=self.use_auth_token,
+                **kwargs
             )
+        elif isinstance(whisper_model, str):
+            self.transcriber = load_transcriber(
+                model=whisper_model,
+                whisper_type=whisper_type,
+                flash=self.flash,
+                timestamp=self.timestamp,
+                min_speakers=self.min_speakers,
+                max_speakers=self.max_speakers,
+                device=self.inference_device, # Note: load_transcriber expects 'device', not 'inference_device'
+                hf_token=self.use_auth_token,
+                **kwargs
+            )
+        else:
+            self.transcriber = whisper_model
 
         if dia_model is None:
             self.diariser = Diariser.load_model(**kwargs)

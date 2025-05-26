@@ -554,7 +554,14 @@ def load_transcriber(model: str = "medium",
                      download_root: str = WHISPER_DEFAULT_PATH,
                      device: Optional[Union[str, device]] = SCRAIBE_TORCH_DEVICE,
                      in_memory: bool = False,
-                     *args, **kwargs
+                   flash: bool = False,
+                   timestamp: str = 'chunk',
+                   hf_token: Optional[str] = None,
+                   min_speakers: Optional[int] = None,
+                   max_speakers: Optional[int] = None,
+                   compute_type: str = 'float16', # Added compute_type for faster-whisper
+                   *args,
+                   **kwargs # Catch any extra args
                      ) -> Union[WhisperTranscriber, FasterWhisperTranscriber]:
     """
     Load whisper model.
@@ -582,12 +589,19 @@ def load_transcriber(model: str = "medium",
         in_memory (bool, optional): Whether to load model in memory.
                                     Defaults to False.
         args: Additional arguments only to avoid errors.
-        kwargs: Additional keyword arguments only to avoid errors.
+        kwargs: Additional keyword arguments for specific transcribers.
+        flash (bool, optional): Enable Flash Attention 2 for InsanelyFastWhisper. Defaults to False.
+        timestamp (str, optional): Timestamp level for InsanelyFastWhisper (\'chunk\' or \'word\'). Defaults to \'chunk\'.
+        hf_token (Optional[str], optional): Hugging Face token for diarization (for InsanelyFastWhisper). Defaults to None.
+        min_speakers (Optional[int], optional): Minimum number of speakers for diarization (for InsanelyFastWhisper). Defaults to None.
+        max_speakers (Optional[int], optional): Maximum number of speakers for diarization (for InsanelyFastWhisper). Defaults to None.
+        compute_type (str, optional): Compute type for faster-whisper. Defaults to 'float16'.
 
     Returns:
         Union[WhisperTranscriber, FasterWhisperTranscriber]:
         One of the Whisper variants as Transcrbier object initialized with the specified model.
     """
+
     if whisper_type.lower() == 'whisper':
         _model = WhisperTranscriber.load_model(
             model, download_root, device, in_memory, *args, **kwargs)
@@ -596,9 +610,11 @@ def load_transcriber(model: str = "medium",
         _model = FasterWhisperTranscriber.load_model(
             model, download_root, device, *args, **kwargs)
         return _model
+
     elif whisper_type.lower() == 'insanely-fast-whisper':
          _model = InsanelyFastWhisperTranscriber.load_model(
-             model, download_root, device, *args, **kwargs)
+ model=model, device=device, flash=flash, timestamp=timestamp,
+ hf_token=hf_token, min_speakers=min_speakers, max_speakers=max_speakers, **kwargs)
          return _model
     else:
         raise ValueError(f'Model type not recognized, exptected "whisper" '
