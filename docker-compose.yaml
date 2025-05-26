@@ -6,6 +6,7 @@ services:
     command: [ "-l" ]  # Login shell for interactive use
     volumes:
       - /tmp:/data
+      - /opt/intel/oneapi/:/opt/intel/oneapi/  # Add this line
     devices:
       - /dev/dri:/dev/dri
     environment:
