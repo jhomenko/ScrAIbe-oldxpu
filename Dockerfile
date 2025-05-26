@@ -69,23 +69,33 @@ LABEL url="https://github.com/JSchmie/ScrAIbe"
 # Copy necessary files from the builder stage
 WORKDIR /app
 
-# Install runtime dependencies in the final stage
+# Install runtime dependencies and Python virtual environment
 RUN apt-get update && \
-    apt-get install -y python3 python3-pip libsm6 libxrender1 libfontconfig1 ffmpeg && \
+    apt-get install -y --no-install-recommends \
+    python3 \
+    python3-pip \
+    python3-dev \
+    python3-venv \
+    libsm6 libxrender1 libfontconfig1 ffmpeg && \
     apt-get clean && \
     rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/*
 
-# Note - Was not working once built Copy installed Python packages from the builder
-# COPY --from=builder /usr/local/lib/python*/dist-packages /usr/local/lib/python/dist-packages
-# COPY --from=builder /usr/local/bin /usr/local/bin
+# Create and activate Python virtual environment
+RUN python3 -m venv /app/venv
+# Set PATH to use the virtual environment's bin directory
+ENV PATH="/app/venv/bin:$PATH"
 
 COPY requirements.txt /app/requirements.txt
 COPY pyproject.toml poetry.lock* /app/
 COPY LICENSE /app/LICENSE
 COPY README.md /app/README.md
-COPY scraibe /app/scraibe
 
-RUN pip install --no-cache-dir -r requirements.txt && \
+# Install Python dependencies using pip within the virtual environment
+RUN pip install --no-cache-dir --upgrade pip setuptools psutil && \
+    pip install --no-cache-dir torch==2.7.10+cpu torchvision==0.22.0+cpu torchaudio==2.7.0+cpu --index-url https://download.pytorch.org/whl/cpu && \
+    pip install --no-cache-dir intel_extension_for_pytorch==2.7.10 oneccl_bind_pt==2.7.10 --extra-index-url https://pytorch-extension.intel.com/release-whl/stable/cpu/us/ && \
+    pip install intel-openmp && \
+    pip install --no-cache-dir -r requirements.txt && \
     pip install .
 
 # Copy your application code and other necessary files
@@ -94,9 +104,6 @@ COPY --from=builder /app/README.md /app/README.md
 
 # Copy models if they are downloaded during the build (adjust path if necessary)
 COPY --from=builder /app/models /app/models
-
-# Set environment variables
-ENTRYPOINT ["scraibe"]
 
 # Copy setvars.sh from builder and the custom entrypoint script
 COPY --from=builder /usr/local/lib/python3.10/dist-packages/oneccl_bindings_for_pytorch/env/setvars.sh /opt/intel/setvars.sh
