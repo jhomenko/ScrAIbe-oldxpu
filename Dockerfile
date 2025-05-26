@@ -96,4 +96,4 @@ COPY --from=builder /app/README.md /app/README.md
 COPY --from=builder /app/models /app/models
 
 # Set environment variables
-ENTRYPOINT ["scraibe"]
+ENTRYPOINT ["python3", "-c", "from whisper.tokenizer import LANGUAGES, TO_LANGUAGE_CODE; print('Successfully imported whisper.tokenizer')"]
