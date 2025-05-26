@@ -6,6 +6,7 @@ output formats, and other options necessary for transcription.
 """
 import os
 import json
+import torch
 from argparse import ArgumentParser, ArgumentDefaultsHelpFormatter
 from torch.cuda import is_available
 from .autotranscript import Scraibe
@@ -63,7 +64,7 @@ def cli():
                         help="HuggingFace token for private model download.")
 
     parser.add_argument("--inference-device",
-                        default="xpu" if is_available() else "cpu",
+                        default="xpu" if hasattr(torch, 'xpu') and torch.xpu.is_available() else "cpu",
                         help="Device to use for PyTorch inference.")
 
     parser.add_argument("--num-threads", type=int, default=None,
