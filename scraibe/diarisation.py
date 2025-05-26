@@ -31,7 +31,7 @@ import warnings
 import os
 import yaml
 from pathlib import Path
-from typing import TypeVar, Union
+from typing import TypeVar, Union, Optional
 
 from pyannote.audio import Pipeline
 from pyannote.audio.pipelines.speaker_diarization import SpeakerDiarization
