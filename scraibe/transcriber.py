@@ -24,9 +24,8 @@ Example Usage:
 >>> transcriber.save_transcript(transcript, "path/to/save.txt")
 """
 from transformers import WhisperForConditionalGeneration, AutoProcessor
-# Import ipex and check for its availability
-try:
 import intel_extension_for_pytorch as ipex
+import torch # Assuming torch is imported elsewhere based on context, explicitly importing it here for clarity in diff
 import subprocess
 import json
 import os
@@ -34,8 +33,6 @@ import tempfile
 
 from whisper import Whisper
 except ImportError:
-    ipex = None
-from whisper import load_model as whisper_load_model
 from whisper.tokenizer import TO_LANGUAGE_CODE
 from faster_whisper import WhisperModel as FasterWhisperModel
 from faster_whisper.tokenizer import _LANGUAGE_CODES as FASTER_WHISPER_LANGUAGE_CODES
@@ -46,6 +43,7 @@ from inspect import signature
 from abc import abstractmethod
 import warnings
 
+from whisper import load_model as whisper_load_model # Moved this import here for clarity
 from .misc import WHISPER_DEFAULT_PATH, SCRAIBE_TORCH_DEVICE, SCRAIBE_NUM_THREADS
 whisper = TypeVar('whisper')
 
