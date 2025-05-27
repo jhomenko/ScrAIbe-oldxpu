@@ -358,12 +358,11 @@ class FasterWhisperTranscriber(Transcriber):
                           f'device {device}! Changing compute type to int8.')
             compute_type = 'int8'
         _model = FasterWhisperModel(model, download_root=download_root,
-                                    device=device if device != 'xpu' else 'auto',
-                                    device_index=0 if device == 'xpu' else None,
- compute_type=compute_type,
- cpu_threads=SCRAIBE_NUM_THREADS)
- # Explicitly set device and device_index for XPU
- if device == 'xpu':
+                                    device=device if device != 'xpu' else 'auto', # Keep this for other devices
+                                    device_index=0 if device == 'xpu' else None, # Keep this for other devices
+                                    compute_type=compute_type,
+                                    cpu_threads=SCRAIBE_NUM_THREADS)
+        if device == 'xpu':
             _model = FasterWhisperModel(model, download_root=download_root,
  device='auto', device_index=0, compute_type=compute_type, cpu_threads=SCRAIBE_NUM_THREADS)
  else:
