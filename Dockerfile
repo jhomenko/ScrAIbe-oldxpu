@@ -68,7 +68,21 @@ RUN python3 -m venv /app/venv &&     . /app/venv/bin/activate &&     python -m p
 # Set PATH to use the virtual environment's bin directory by default
 ENV PATH="/app/venv/bin:$PATH"
 
-# Copy application files and requirements
+# Install dependencies explicitly within the virtual environment
+RUN . /app/venv/bin/activate && \
+    pip install --no-cache-dir \
+    torch==2.7.0 torchvision==0.22.0 torchaudio==2.7.0 --index-url https://download.pytorch.org/whl/cpu
+
+RUN . /app/venv/bin/activate && \
+    pip install --no-cache-dir \
+    intel-extension-for-pytorch==2.7.10+xpu oneccl_bind_pt==2.7.0+xpu --extra-index-url https://pytorch-extension.intel.com/release-whl/stable/xpu/us/
+
+RUN . /app/venv/bin/activate && \
+    pip install --no-cache-dir intel-openmp
+
+# Install other dependencies from requirements.txt, grouping them
+
+# Copy application files
 COPY requirements.txt /app/requirements.txt
 COPY README.md /app/README.md
 COPY LICENSE /app/LICENSE
@@ -85,10 +99,6 @@ LABEL description="Scraibe is a tool for automatic speech recognition and speake
                     It is designed to be used with the Whisper model, a lightweight model for automatic \
                     speech recognition and speaker diarization."
 LABEL url="https://github.com/JSchmie/ScrAIbe"
-RUN . /app/venv/bin/activate && \
-    pip install --no-cache-dir -r requirements.txt
-
-# Install ScrAIbe itself within the virtual environment
 RUN . /app/venv/bin/activate && \
     pip install .
 
