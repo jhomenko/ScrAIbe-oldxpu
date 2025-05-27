@@ -46,6 +46,10 @@ def cli():
     parser.add_argument("--whisper-model-directory", type=str, default=None,
                         help="Path to save Whisper model files; defaults to ./models/whisper.")
 
+    parser.add_argument("--compute-type", type=str, default="float16",
+                        help="Compute type for faster-whisper (e.g., float16, int8).")
+
+
     parser.add_argument("--diarization-directory", type=str, default=None,
                         help="Path to the diarization model directory.")
 

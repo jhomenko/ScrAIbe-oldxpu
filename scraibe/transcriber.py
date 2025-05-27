@@ -23,12 +23,18 @@ Example Usage:
 >>> transcript = transcriber.transcribe(audio="path/to/audio.wav")
 >>> transcriber.save_transcript(transcript, "path/to/save.txt")
 """
+from transformers import WhisperForConditionalGeneration, AutoProcessor
+# Import ipex and check for its availability
+try:
+import intel_extension_for_pytorch as ipex
 import subprocess
 import json
 import os
 import tempfile
 
 from whisper import Whisper
+except ImportError:
+    ipex = None
 from whisper import load_model as whisper_load_model
 from whisper.tokenizer import TO_LANGUAGE_CODE
 from faster_whisper import WhisperModel as FasterWhisperModel
@@ -179,7 +185,149 @@ class Transcriber:
 
 
 class WhisperTranscriber(Transcriber):
-    def __init__(self, model: whisper, model_name: str) -> None:
+    def __init__(self, model: WhisperForConditionalGeneration, processor: AutoProcessor, model_name: str) -> None:
+        super().__init__(model, model_name) # Store the WhisperForConditionalGeneration model
+        self._processor = processor # Store the processor
+
+
+    def transcribe(self, audio: Union[str, Tensor, ndarray],
+                   *args, **kwargs) -> str:
+        """
+        Transcribe an audio file.
+
+        Args:
+            audio (Union[str, Tensor, ndarray]): The audio input (waveform tensor).
+            *args: Additional arguments.
+            **kwargs: Additional keyword arguments, 
+                        such as the language of the audio file.
+
+        Returns:
+        # Process audio using the loaded processor
+        inputs = self._processor(waveform.squeeze(0), return_tensors="pt", sampling_rate=sample_rate).input_features
+
+        # Move inputs to the model's device
+        inputs = inputs.to(self.model.device)
+
+        # Generate transcription using the model's generate method
+        generated_ids = self.model.generate(inputs)
+
+
+        # Decode the generated IDs to text
+        transcription = self._processor.batch_decode(generated_ids, skip_special_tokens=True)[0]
+
+        return transcription
+
+    @classmethod
+    def load_model(cls,
+                   model: str = "medium",
+                   download_root: str = WHISPER_DEFAULT_PATH,
+                   device: Optional[Union[str, device]] = SCRAIBE_TORCH_DEVICE,
+                   in_memory: bool = False, # This argument is not used in the new loading logic but kept for compatibility
+                   *args, **kwargs
+                   ) -> 'WhisperTranscriber':
+        """
+        Load whisper model using the transformers library with potential IPEX optimization.
+
+        Args:
+            model (str): Whisper model name (e.g., "medium", "large-v3").
+            download_root (str, optional): Path to download the model (handled by transformers). Defaults to WHISPER_DEFAULT_PATH.
+            device (Optional[Union[str, torch.device]], optional): Device to load model on. Defaults to SCRAIBE_TORCH_DEVICE.
+            in_memory (bool, optional): This argument is not used in this implementation. Defaults to False.
+            args: Additional arguments (ignored).
+            kwargs: Additional keyword arguments (ignored).
+
+        Returns:
+            WhisperTranscriber: A WhisperTranscriber object initialized with the loaded model and processor.
+        """
+        # Determine the full model name from Hugging Face
+        hf_model_name = f'openai/whisper-{model}' if '/' not in model else model
+
+        # Determine the torch dtype based on the device
+        torch_dtype = torch.float16 if device != 'cpu' else torch.float32
+
+        _model = None
+        _processor = None
+
+        if str(device) == 'xpu' and hasattr(torch, 'xpu') and ipex is not None:
+            try:
+                # Attempt to load the model using ipex.OnDevice context manager
+                with ipex.OnDevice(dtype=torch_dtype, device=device):
+                    _model = WhisperForConditionalGeneration.from_pretrained(
+                        hf_model_name,
+                        torch_dtype=torch_dtype,
+                        low_cpu_mem_usage=True,
+                        trust_remote_code=True,
+                    )
+            except Exception as e:
+                warnings.warn(f"Failed to load model with ipex.OnDevice: {e}. Falling back to regular loading.")
+                # Fallback to regular loading on the specified device if IPEX loading fails
+                try:
+                    _model = WhisperForConditionalGeneration.from_pretrained(
+                        hf_model_name,
+                        torch_dtype=torch_dtype,
+                        low_cpu_mem_usage=True,
+                        trust_remote_code=True,
+                    ).to(device)
+                except Exception as fallback_e:
+                    raise RuntimeError(f"Failed to load model even without ipex.OnDevice: {fallback_e}") from fallback_e
+        else:
+            # Load the model without ipex.OnDevice if device is not xpu or ipex is not available
+            try:
+                _model = WhisperForConditionalGeneration.from_pretrained(
+                    hf_model_name,
+                    torch_dtype=torch_dtype,
+                    low_cpu_mem_usage=True,
+                    trust_remote_code=True,
+                ).to(device)
+            except Exception as e:
+                raise RuntimeError(f"Failed to load model: {e}") from e
+
+        # Load the processor
+        try:
+            _processor = AutoProcessor.from_pretrained(hf_model_name)
+        except Exception as e:
+            # Clean up the loaded model if processor loading fails
+            if _model is not None:
+                del _model
+                torch.cuda.empty_cache() # Clear CUDA cache if applicable
+            raise RuntimeError(f"Failed to load processor: {e}") from e
+
+        return cls(_model, _processor, model_name=model)
+
+    @staticmethod
+    def _get_whisper_kwargs(**kwargs) -> dict:
+        """
+        This method is kept for compatibility but is not used in the Hugging Face transformers based transcription.
+        """
+        # In the new implementation using transformers, keyword arguments for transcribe
+        # are passed directly to the model's generate method or handled by the processor.
+        # This method might need to be adapted or removed depending on how you want
+        # to map your existing CLI/API arguments to the transformers generate parameters.
+
+        # For now, returning a subset of potentially relevant kwargs.
+        relevant_kwargs = {}
+        # Example: mapping 'language' to 'forced_decoder_ids' if needed
+        # if 'language' in kwargs:
+        #     # You would need logic here to convert language name/code to token IDs
+        #     pass
+        # Add other relevant kwargs as needed, matching transformers generate arguments
+        # e.g., temperature, num_beams, etc.
+
+        # Note: Many Whisper arguments like 'verbose' or file paths are handled
+        # differently or not applicable when using the transformers pipeline.
+        warnings.warn("'_get_whisper_kwargs' is not fully utilized in the transformers-based WhisperTranscriber. "
+                      "Transcription arguments are handled by the Hugging Face model's generate method and processor.")
+
+        # Returning all kwargs for now, but the transcribe method will only use what's relevant for model.generate
+        # You might want to filter this based on model.generate signature
+        return kwargs
+
+    def __repr__(self) -> str:
+        return f"WhisperTranscriber(model_name={self.model_name})"
+
+
+class FasterWhisperTranscriber(Transcriber):
+    def __init__(self, model: FasterWhisperModel, model_name: str) -> None:
         super().__init__(model, model_name)
 
     def transcribe(self, audio: Union[str, Tensor, ndarray],
@@ -190,31 +338,31 @@ class WhisperTranscriber(Transcriber):
         Args:
             audio (Union[str, Tensor, nparray]): The audio file to transcribe.
             *args: Additional arguments.
-            **kwargs: Additional keyword arguments, 
+            **kwargs: Additional keyword arguments,
                         such as the language of the audio file.
 
         Returns:
             str: The transcript as a string.
         """
-
         kwargs = self._get_whisper_kwargs(**kwargs)
 
-        if not kwargs.get("verbose"):
-            kwargs["verbose"] = None
-
-        result = self.model.transcribe(audio, *args, **kwargs)
-        return result["text"]
+        if isinstance(audio, Tensor):
+            audio = audio.cpu().numpy()
+        result, _ = self.model.transcribe(audio, *args, **kwargs)
+        text = ""
+        for seg in result:
+            text += seg.text
+        return text
 
     @classmethod
     def load_model(cls,
                    model: str = "medium",
                    download_root: str = WHISPER_DEFAULT_PATH,
                    device: Optional[Union[str, device]] = SCRAIBE_TORCH_DEVICE,
-                   in_memory: bool = False,
                    *args, **kwargs
-                   ) -> 'WhisperTranscriber':
+                   ) -> 'FasterWhisperTranscriber':
         """
-        Load whisper model.
+        Load faster-whisper model.
 
         Args:
             model (str): Whisper model. Available models include:
@@ -234,9 +382,9 @@ class WhisperTranscriber(Transcriber):
             download_root (str, optional): Path to download the model.
                                             Defaults to WHISPER_DEFAULT_PATH.
 
-            device (Optional[Union[str, torch.device]], optional): 
-                                        Device to load model on. Defaults to None.
-            in_memory (bool, optional): Whether to load model in memory. 
+            device (Optional[Union[str, torch.device]], optional):
+                                        Device to load model on. Defaults to SCRAIBE_TORCH_DEVICE.
+            in_memory (bool, optional): Whether to load model in memory.
                                         Defaults to False.
             args: Additional arguments only to avoid errors.
             kwargs: Additional keyword arguments only to avoid errors.
@@ -247,30 +395,48 @@ class WhisperTranscriber(Transcriber):
         # Explicitly try to use 'xpu' if device is not specified
         if device is None:
             device = "xpu" if torch.xpu.is_available() else SCRAIBE_TORCH_DEVICE
-        _model = whisper_load_model(model, download_root=download_root,
+        if not isinstance(device, str):
 
-                                    device=device, in_memory=in_memory)
+            device = str(device)
+
+        compute_type = kwargs.get('compute_type', 'float16')
+        if device == 'cpu' and compute_type == 'float16':
+            warnings.warn(f'Compute type {compute_type} not compatible with '
+                          f'device {device}! Changing compute type to int8.')
+            compute_type = 'int8'
+        # Determine if we should use XPU based on the device string and torch.xpu availability
+        use_xpu = (device == 'xpu' or (isinstance(device, str) and 'xpu' in device) or (isinstance(device, torch.device) and device.type == 'xpu')) and hasattr(torch, 'xpu') and torch.xpu.is_available()
+
+        if use_xpu:
+            _model = FasterWhisperModel(model, download_root=download_root,
+                                        device='auto', device_index=0, compute_type=compute_type, cpu_threads=SCRAIBE_NUM_THREADS)
+        else:
+            # Use the provided device string directly for non-XPU devices
+            _model = FasterWhisperModel(model, download_root=download_root,
+                                        device=device, compute_type=compute_type, cpu_threads=SCRAIBE_NUM_THREADS)
 
         return cls(_model, model_name=model)
-
     @staticmethod
     def _get_whisper_kwargs(**kwargs) -> dict:
         """
-        Get kwargs for whisper model. Ensure that kwargs are valid.
+        Get kwargs for faster-whisper model. Ensure that kwargs are valid.
 
         Returns:
-            dict: Keyword arguments for whisper model.
+            dict: Keyword arguments for faster-whisper model.
         """
         # _possible_kwargs = WhisperModel.transcribe.__code__.co_varnames
-        _possible_kwargs = signature(Whisper.transcribe).parameters.keys()
+        _possible_kwargs = signature(FasterWhisperModel.transcribe).parameters.keys()
 
         whisper_kwargs = {k: v for k,
                           v in kwargs.items() if k in _possible_kwargs}
 
         if (task := kwargs.get("task")):
+            kwargs["verbose"] = None
+
             whisper_kwargs["task"] = task
 
         if (language := kwargs.get("language")):
+            language = FasterWhisperTranscriber.convert_to_language_code(language)
             whisper_kwargs["language"] = language
 
         return whisper_kwargs
@@ -542,7 +708,10 @@ class InsanelyFastWhisperTranscriber(Transcriber):
         # We don't actually load the model in this class's load_model.
         # The model is handled by the subprocess call in transcribe.
         # We just instantiate the transcriber with the config.
-        return cls(model=model, device=str(device), flash=flash, timestamp=timestamp,
+        # Determine the full model name for Insanely Fast Whisper
+        full_model_name = model if '/' in model else f'openai/whisper-{model}'
+
+        return cls(model=full_model_name, device=str(device), flash=flash, timestamp=timestamp,
                    hf_token=hf_token, min_speakers=min_speakers, max_speakers=max_speakers)
 
     @staticmethod
