@@ -357,18 +357,14 @@ class FasterWhisperTranscriber(Transcriber):
             warnings.warn(f'Compute type {compute_type} not compatible with '
                           f'device {device}! Changing compute type to int8.')
             compute_type = 'int8'
-        _model = FasterWhisperModel(model, download_root=download_root,
-                                    device=device if device != 'xpu' else 'auto', # Keep this for other devices
-                                    device_index=0 if device == 'xpu' else None, # Keep this for other devices
-                                    compute_type=compute_type,
-                                    cpu_threads=SCRAIBE_NUM_THREADS)
         if device == 'xpu':
             _model = FasterWhisperModel(model, download_root=download_root,
- device='auto', device_index=0, compute_type=compute_type, cpu_threads=SCRAIBE_NUM_THREADS)
- else:
+                                        device='auto', device_index=0, compute_type=compute_type, cpu_threads=SCRAIBE_NUM_THREADS)
+        else:
             _model = FasterWhisperModel(model, download_root=download_root,
- device=device, compute_type=compute_type, cpu_threads=SCRAIBE_NUM_THREADS)
+                                        device=device, compute_type=compute_type, cpu_threads=SCRAIBE_NUM_THREADS)
 
+        return cls(_model, model_name=model)
     @staticmethod
     def _get_whisper_kwargs(**kwargs) -> dict:
         """
@@ -614,7 +610,7 @@ def load_transcriber(model: str = "medium",
         return _model
     elif whisper_type.lower() == 'faster-whisper':
         _model = FasterWhisperTranscriber.load_model(
-            model, download_root, device, *args, **kwargs)
+ model, download_root, device, *args, compute_type=compute_type, **kwargs)
         return _model
 
     elif whisper_type.lower() == 'insanely-fast-whisper':
