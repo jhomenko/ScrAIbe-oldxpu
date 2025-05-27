@@ -32,7 +32,6 @@ import os
 import tempfile
 
 from whisper import Whisper
-except ImportError:
 from whisper.tokenizer import TO_LANGUAGE_CODE
 from faster_whisper import WhisperModel as FasterWhisperModel
 from faster_whisper.tokenizer import _LANGUAGE_CODES as FASTER_WHISPER_LANGUAGE_CODES
