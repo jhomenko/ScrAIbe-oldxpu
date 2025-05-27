@@ -41,7 +41,7 @@ from tqdm import trange
 
 # Application-Specific Imports
 from .audio import AudioProcessor
-from .diarisation import Diariser, DiarisationType
+from .diarisation import Diariser
 from .transcriber import Transcriber, load_transcriber, whisper, InsanelyFastWhisperTranscriber
 from .transcript_exporter import Transcript
 from .misc import SCRAIBE_TORCH_DEVICE
