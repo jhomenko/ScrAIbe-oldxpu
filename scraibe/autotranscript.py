@@ -41,8 +41,8 @@ from tqdm import trange
 
 # Application-Specific Imports
 from .audio import AudioProcessor
-from .diarisation import Diariser
-from .transcriber import Transcriber, load_transcriber, whisper
+from .diarisation import Diariser, DiarisationType
+from .transcriber import Transcriber, load_transcriber, whisper, InsanelyFastWhisperTranscriber
 from .transcript_exporter import Transcript
 from .misc import SCRAIBE_TORCH_DEVICE
 
@@ -141,7 +141,7 @@ class Scraibe:
             )
         else:
             self.transcriber = whisper_model
-
+            
         if dia_model is None:
             self.diariser = Diariser.load_model(**kwargs)
         elif isinstance(dia_model, str):
