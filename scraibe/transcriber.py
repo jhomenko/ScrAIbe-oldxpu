@@ -222,8 +222,7 @@ class WhisperTranscriber(Transcriber):
                    in_memory: bool = False, # This argument is not used in the new loading logic but kept for compatibility
                    *args, **kwargs
                    ) -> 'WhisperTranscriber':
-        """
-        Load whisper model using the transformers library with potential IPEX optimization.
+ #       """
 
         Args:
             model (str): Whisper model name (e.g., "medium", "large-v3").

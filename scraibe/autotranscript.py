@@ -125,7 +125,7 @@ class Scraibe:
                 min_speakers=self.min_speakers,
                 max_speakers=self.max_speakers,
                 device=self.inference_device, # Note: load_transcriber expects 'device', not 'inference_device'
- compute_type=compute_type,
+                compute_type=compute_type,
                 hf_token=self.use_auth_token,
                 **kwargs
             )
@@ -138,7 +138,7 @@ class Scraibe:
                 min_speakers=self.min_speakers,
                 max_speakers=self.max_speakers,
                 device=self.inference_device, # Note: load_transcriber expects 'device', not 'inference_device'
- compute_type=compute_type,
+                compute_type=compute_type,
                 hf_token=self.use_auth_token,
                 **kwargs
             )
