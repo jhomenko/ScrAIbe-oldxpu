@@ -36,6 +36,9 @@ import torch
 from numpy import ndarray
 import torchaudio
 
+# tqdm import
+from tqdm import trange
+
 # Application-Specific Imports
 from .audio import AudioProcessor
 from .diarisation import Diariser
