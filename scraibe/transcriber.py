@@ -35,6 +35,9 @@ from numpy import ndarray
 from inspect import signature
 from abc import abstractmethod
 from transformers.utils import ModelOutput
+from transformers import (
+ ModelOutput,
+)
 import transformers
 from packaging import version
 
@@ -207,17 +210,18 @@ class WhisperTranscriber(Transcriber):
         if not kwargs.get("verbose"):
             kwargs["verbose"] = None
 
- with torch.xpu.amp.autocast(enabled=True, dtype=torch.float16):
- result = self.whisper_generate(audio, *args, **kwargs)
+        with torch.xpu.amp.autocast(enabled=True, dtype=torch.float16):
+            result = self.whisper_generate(audio, *args, **kwargs)
 
- # Assuming whisper_generate returns a dictionary with a 'sequences' key containing the token IDs
- # We need to convert these token IDs back to text. This might require using the model's tokenizer.
- # The exact method depends on the structure of `result` from whisper_generate and the model's tokenizer.
- # For now, let's assume `result` is a dictionary and the output we want is in 'sequences'
- # and we can use the model's tokenizer's decode method.
- # If whisper_generate returns something else, this part will need adjustment.
+        # Assuming whisper_generate returns a dictionary with a 'sequences' key containing the token IDs
+        # We need to convert these token IDs back to text. This might require using the model's tokenizer.
+        # The exact method depends on the structure of `result` from whisper_generate and the model's tokenizer.
+        # For now, let's assume `result` is a dictionary and the output we want is in 'sequences'
+        # and we can use the model's tokenizer's decode method.
+        # If whisper_generate returns something else, this part will need adjustment.
 
- if isinstance(result, dict) and 'sequences' in result:
+        if isinstance(result, dict) and 'sequences' in result:
+            
  # Assuming self.model has a tokenizer attribute
  if hasattr(self.model, 'tokenizer'):
  # Decode the token IDs. Assuming sequences is a tensor of token IDs.
@@ -235,11 +239,11 @@ class WhisperTranscriber(Transcriber):
  text = str(result) # Return string representation as a fallback
  else:
  warnings.warn("Expected a dictionary result from whisper_generate. Returning raw result.")
- text = str(result) # Return string representation as a fallback
+            text = str(result) # Return string representation as a fallback
 
- return text
+        return text
 
-
+    # Helper functions and whisper_generate copied from utils.py
  @staticmethod
  def _extract_past_from_model_output(
  self, outputs: ModelOutput, standardize_cache_format: bool = False
