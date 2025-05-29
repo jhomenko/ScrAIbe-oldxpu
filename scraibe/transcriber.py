@@ -35,6 +35,7 @@ from numpy import ndarray
 from inspect import signature
 from abc import abstractmethod
 
+import torch
 import warnings
 import intel_extension_for_pytorch as ipex
 from .misc import WHISPER_DEFAULT_PATH, SCRAIBE_TORCH_DEVICE, SCRAIBE_NUM_THREADS
