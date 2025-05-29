@@ -35,8 +35,11 @@ tqdm = "^4.66.5"
 numpy = "^1.26.4"
 openai-whisper = ">=20231117,<20240931"
 faster-whisper = "^1.0.3"
-"pyannote.audio" = "^3.3.1"
-torch = "^2.1.2"
+"pyannote.audio" = ">=3.1.0"
+torch = "==2.7.0"
+torchaudio = "==2.7.0"
+intel-extension-for-pytorch = "==2.7.10+xpu"
+oneccl_bind_pt = "==2.7.0+xpu"
 
 [tool.poetry.group.dev.dependencies]
 pytest = "^8.1.1"
@@ -71,3 +74,11 @@ app = ["scraibe-webui"]
 [tool.ruff.lint.extend-per-file-ignores]
 "__init__.py" = ["E402","F403",'F401']
 "scraibe/misc.py" = ["E722"]
+
+[[source]]
+name = "pytorch-xpu"
+url = "https://download.pytorch.org/whl/xpu"
+
+[[source]]
+name = "intel"
+url = "https://pytorch-extension.intel.com/release-whl/stable/xpu/us/"

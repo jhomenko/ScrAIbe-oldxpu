@@ -25,7 +25,6 @@ Usage:
 
 # Standard Library Imports
 import os
-from glob import iglob
 from subprocess import run
 from typing import TypeVar, Union
 from warnings import warn
@@ -33,8 +32,10 @@ from warnings import warn
 # Third-Party Imports
 import torch
 from numpy import ndarray
+import intel_extension_for_pytorch as ipex
 from tqdm import trange
 
+from glob import iglob
 # Application-Specific Imports
 from .audio import AudioProcessor
 from .diarisation import Diariser
@@ -145,7 +146,7 @@ class Scraibe:
 
         # Prepare waveform and sample rate for diarization
         dia_audio = {
-            "waveform": audio_file.waveform.reshape(1, len(audio_file.waveform)).to(self.device),
+            "waveform": audio_file.waveform.reshape(1, len(audio_file.waveform)).to(SCRAIBE_TORCH_DEVICE).to(torch.float16),
             "sample_rate": audio_file.sr
         }
         
@@ -177,6 +178,7 @@ class Scraibe:
 
             seg = diarisation["segments"][i]
 
+            # Get the audio segment based on diarization results
             audio = audio_file.cut(seg[0], seg[1])
 
             transcript = self.transcriber.transcribe(audio, **kwargs)
@@ -215,8 +217,8 @@ class Scraibe:
 
         # Prepare waveform and sample rate for diarization
         dia_audio = {
-            "waveform": audio_file.waveform.reshape(1, len(audio_file.waveform)).to(self.device),
-            "sample_rate": audio_file.sr
+            "waveform": audio_file.waveform.reshape(1, len(audio_file.waveform)).to(SCRAIBE_TORCH_DEVICE),
+            "sample_rate": audio_file.sr 
         }
 
         print("Starting diarisation.")

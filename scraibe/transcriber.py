@@ -34,8 +34,9 @@ from torch import Tensor, device
 from numpy import ndarray
 from inspect import signature
 from abc import abstractmethod
-import warnings
 
+import warnings
+import intel_extension_for_pytorch as ipex
 from .misc import WHISPER_DEFAULT_PATH, SCRAIBE_TORCH_DEVICE, SCRAIBE_NUM_THREADS
 whisper = TypeVar('whisper')
 
@@ -192,6 +193,9 @@ class WhisperTranscriber(Transcriber):
         Returns:
             str: The transcript as a string.
         """
+        if isinstance(audio, Tensor):
+            audio = audio.to(self.model.device).to(torch.float16) # Use self.model.device for consistency
+
 
         kwargs = self._get_whisper_kwargs(**kwargs)
 
@@ -241,8 +245,9 @@ class WhisperTranscriber(Transcriber):
             Transcriber: A Transcriber object initialized with the specified model.
         """
 
-        _model = whisper_load_model(model, download_root=download_root,
-                                    device=device, in_memory=in_memory)
+        _model = whisper_load_model(model, download_root=download_root, device=device, in_memory=in_memory)
+        _model = ipex.optimize(_model.eval(), dtype=torch.float16)
+        _model.to(torch.float16)
 
         return cls(_model, model_name=model)
 
@@ -345,8 +350,7 @@ class FasterWhisperTranscriber(Transcriber):
         compute_type = kwargs.get('compute_type', 'float16')
         if device == 'cpu' and compute_type == 'float16':
             warnings.warn(f'Compute type {compute_type} not compatible with '
-                          f'device {device}! Changing compute type to int8.')
-            compute_type = 'int8'
+ f'device {device}! Changing compute type to int8.') compute_type = 'int8'
         _model = FasterWhisperModel(model, download_root=download_root,
                                     device=device, compute_type=compute_type, 
                                     cpu_threads=SCRAIBE_NUM_THREADS)

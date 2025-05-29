@@ -2,7 +2,7 @@ import os
 import yaml
 from argparse import Action
 from ast import literal_eval
-from torch.cuda import is_available
+from torch.cuda import is_available as is_cuda_available
 from torch import get_num_threads, set_num_threads
 
 CACHE_DIR = os.getenv(
@@ -20,7 +20,10 @@ PYANNOTE_DEFAULT_CONFIG = os.path.join(PYANNOTE_DEFAULT_PATH, "config.yaml") \
     if os.path.exists(os.path.join(PYANNOTE_DEFAULT_PATH, "config.yaml")) \
     else ('Jaikinator/ScrAIbe', 'pyannote/speaker-diarization-3.1')
 
-SCRAIBE_TORCH_DEVICE =  os.getenv("SCRAIBE_TORCH_DEVICE", "cuda" if is_available() else "cpu")
+from torch.xpu import is_available as is_xpu_available
+
+SCRAIBE_TORCH_DEVICE = os.getenv("SCRAIBE_TORCH_DEVICE", "xpu:0" if is_xpu_available()
+                               else ("cuda" if is_cuda_available() else "cpu"))
 
 SCRAIBE_NUM_THREADS = os.getenv("SCRAIBE_NUM_THREADS", min(8, get_num_threads()))
 
