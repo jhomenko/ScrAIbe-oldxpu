@@ -35,6 +35,7 @@ from numpy import ndarray
 from inspect import signature
 from abc import abstractmethod
 
+import torch.xpu.amp
 import torch
 import warnings
 import intel_extension_for_pytorch as ipex
@@ -203,7 +204,8 @@ class WhisperTranscriber(Transcriber):
         if not kwargs.get("verbose"):
             kwargs["verbose"] = None
 
-        result = self.model.transcribe(audio, *args, **kwargs)
+        with torch.xpu.amp.autocast(enabled=True, dtype=torch.float16):
+            result = self.model.transcribe(audio, *args, **kwargs)
         return result["text"]
 
     @classmethod
