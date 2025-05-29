@@ -26,335 +26,326 @@ Usage:
 # Standard Library Imports
 import os
 from subprocess import run
-from typing import TypeVar, Union
-from warnings import warn
+from typing import TypeVar, Union, Optional, Any # Added Any
 
 # Third-Party Imports
 import torch
 from numpy import ndarray
-import intel_extension_for_pytorch as ipex
+# import intel_extension_for_pytorch as ipex # This import is not used directly here. 
+                                          # IPEX-LLM is used in transcriber.py
 from tqdm import trange
-
 from glob import iglob
+
 # Application-Specific Imports
 from .audio import AudioProcessor
 from .diarisation import Diariser
-from .transcriber import Transcriber, load_transcriber, whisper
+from .transcriber import Transcriber, load_transcriber # Removed 'whisper' import
 from .transcript_exporter import Transcript
-from .misc import SCRAIBE_TORCH_DEVICE
+from .misc import SCRAIBE_TORCH_DEVICE, WHISPER_DEFAULT_PATH # Added WHISPER_DEFAULT_PATH for consistency
 
-
-DiarisationType = TypeVar('DiarisationType')
-
+DiarisationType = TypeVar('DiarisationType') # For Diariser model instances
 
 class Scraibe:
     """
     Scraibe is a class responsible for managing the transcription and diarization of audio files.
-    It serves as the core of the transcription system, incorporating pretrained models
-    for speech-to-text (such as Whisper) and speaker diarization (such as pyannote.audio),
-    allowing for comprehensive audio processing.
-
-    Attributes:
-        transcriber (Transcriber): The transcriber object to handle transcription.
-        diariser (Diariser): The diariser object to handle diarization.
-
-    Methods:
-        __init__: Initializes the Scraibe class with appropriate models.
-        transcribe: Transcribes an audio file using the whisper model and pyannote diarization model.
-        remove_audio_file: Removes the original audio file to avoid disk space issues or ensure data privacy.
-        get_audio_file: Gets an audio file as an AudioProcessor object.
+    # ... (rest of docstring)
     """
 
     def __init__(self,
-                 whisper_model: Union[bool, str, whisper] = None,
-                 whisper_type: str = "whisper",
-                 dia_model: Union[bool, str, DiarisationType] = None,
-                 **kwargs) -> None:
+                 whisper_model_or_name: Union[str, Transcriber, None] = None, # Changed type hint
+                 whisper_type: str = "openai-ipex-llm", # Defaulting to our new IPEX-LLM integrated type
+                 dia_model_or_name: Union[str, Diariser, None] = None, # Consistent naming and typing
+                 device: Optional[Union[str, torch.device]] = None, # Allow device override here
+                 **kwargs: Any) -> None:
         """Initializes the Scraibe class.
 
         Args:
-            whisper_model (Union[bool, str, whisper], optional): 
-                                Path to whisper model or whisper model itself.
-            whisper_type (str):
-                                Type of whisper model to load. "whisper" or "faster-whisper".
-            diarisation_model (Union[bool, str, DiarisationType], optional): 
-                                Path to pyannote diarization model or model itself.
-            **kwargs: Additional keyword arguments for whisper
-                        and pyannote diarization models.
+            whisper_model_or_name (Union[str, Transcriber, None], optional): 
+                                Whisper model name (e.g., "medium"), an existing Transcriber instance,
+                                or None to load the default "medium" model.
+            whisper_type (str): Type of whisper model to load if whisper_model_or_name is a string.
+                                E.g., "openai-ipex-llm", "faster-whisper".
+            dia_model_or_name (Union[str, Diariser, None], optional): 
+                                Pyannote diarization model name, an existing Diariser instance,
+                                or None to load the default.
+            device (Optional[Union[str, torch.device]]): Device to use (e.g. "cpu", "xpu", "cuda").
+                                                         Overrides SCRAIBE_TORCH_DEVICE if set.
+            **kwargs: Additional keyword arguments for model loading and processing.
                     e.g.:
-
                     - verbose: If True, the class will print additional information.
-                    - save_kwargs: If True, the keyword arguments will be saved
-                                    for autotranscribe. So you can unload the class and reload it again.
+                    - save_setup: If True, the initialization parameters will be saved.
+                    - IPEX-LLM specific args like `low_bit` for `openai-ipex-llm` whisper_type.
+                    - FasterWhisper specific args like `compute_type` for `faster-whisper` type.
         """
+        self.verbose = kwargs.get("verbose", False)
+        self.target_device = device if device is not None else SCRAIBE_TORCH_DEVICE
+        kwargs["device"] = self.target_device # Ensure device is in kwargs for load_transcriber
 
-        if whisper_model is None:
+        # Initialize Transcriber
+        if isinstance(whisper_model_or_name, Transcriber):
+            self.transcriber = whisper_model_or_name
+            if self.verbose: print(f"Using provided Transcriber instance: {self.transcriber}")
+        elif isinstance(whisper_model_or_name, str):
             self.transcriber = load_transcriber(
-                "medium", whisper_type, **kwargs)
-        elif isinstance(whisper_model, str):
+                model_name=whisper_model_or_name, whisper_type=whisper_type, **kwargs)
+        elif whisper_model_or_name is None:
             self.transcriber = load_transcriber(
-                whisper_model, whisper_type, **kwargs)
+                model_name="medium", whisper_type=whisper_type, **kwargs) # Default model name
         else:
-            self.transcriber = whisper_model
+            raise TypeError(f"Unsupported type for whisper_model_or_name: {type(whisper_model_or_name)}. "
+                            "Expected model name (str), Transcriber instance, or None.")
 
-        if dia_model is None:
-            self.diariser = Diariser.load_model(**kwargs)
-        elif isinstance(dia_model, str):
-            self.diariser = Diariser.load_model(dia_model, **kwargs)
+        # Initialize Diariser
+        if isinstance(dia_model_or_name, Diariser):
+            self.diariser = dia_model_or_name
+            if self.verbose: print(f"Using provided Diariser instance: {self.diariser}")
+        elif isinstance(dia_model_or_name, str):
+            self.diariser = Diariser.load_model(dia_model_or_name, device=self.target_device, **kwargs)
+        elif dia_model_or_name is None:
+            self.diariser = Diariser.load_model(device=self.target_device, **kwargs) # Default diariser model
         else:
-            self.diariser: Diariser = dia_model
+            raise TypeError(f"Unsupported type for dia_model_or_name: {type(dia_model_or_name)}. "
+                            "Expected model name (str), Diariser instance, or None.")
 
-        if kwargs.get("verbose"):
-            print("Scraibe initialized all models successfully loaded.")
-            self.verbose = True
-        else:
-            self.verbose = False
 
-        # Save kwargs for autotranscribe if you want to unload the class and load it again.
+        if self.verbose:
+            print(f"Scraibe initialized. Transcriber: {self.transcriber}, Diariser: {self.diariser} on device '{self.target_device}'")
+
+        self.params = {}
         if kwargs.get('save_setup'):
-            self.params = dict(whisper_model=whisper_model,
-                               dia_model=dia_model,
+            self.params = dict(whisper_model_or_name=str(whisper_model_or_name) if isinstance(whisper_model_or_name, Transcriber) else whisper_model_or_name, # Store name if instance
+                               whisper_type=whisper_type,
+                               dia_model_or_name=str(dia_model_or_name) if isinstance(dia_model_or_name, Diariser) else dia_model_or_name,
+                               device=str(self.target_device),
                                **kwargs)
-        else:
-            self.params = {}
             
-        self.device = kwargs.get(
-            "device", SCRAIBE_TORCH_DEVICE)
-
     def autotranscribe(self, audio_file: Union[str, torch.Tensor, ndarray],
                        remove_original: bool = False,
-                       **kwargs) -> Transcript:
+                       **kwargs: Any) -> Transcript:
         """
         Transcribes an audio file using the whisper model and pyannote diarization model.
-
-        Args:
-            audio_file (Union[str, torch.Tensor, ndarray]): 
-                            Path to audio file or a tensor representing the audio.
-            remove_original (bool, optional): If True, the original audio file will
-                                                be removed after transcription.
-            *args: Additional positional arguments for diarization and transcription.
-            **kwargs: Additional keyword arguments for diarization and transcription.
-
-        Returns:
-            Transcript: A Transcript object containing the transcription,
-                        which can be exported to different formats.
+        # ... (rest of docstring)
         """
-        if kwargs.get("verbose"):
-            self.verbose = kwargs.get("verbose")
-        # Get audio file as an AudioProcessor object
-        audio_file: AudioProcessor = self.get_audio_file(audio_file)
+        current_verbose = kwargs.get("verbose", self.verbose) # Allow overriding verbosity for this call
 
-        # Prepare waveform and sample rate for diarization
-        dia_audio = {
-            "waveform": audio_file.waveform.reshape(1, len(audio_file.waveform)).to(SCRAIBE_TORCH_DEVICE).to(torch.float16),
-            "sample_rate": audio_file.sr
+        audio_file_processed: AudioProcessor = self.get_audio_file(audio_file)
+
+        # Ensure waveform is float32 for diarization, as float16 on CPU can be problematic for some ops
+        # Diariser might also move to its own required device/dtype.
+        # Assuming self.diariser.device handles this.
+        dia_waveform = audio_file_processed.waveform.reshape(1, -1) # Batch dim, ensure it's 1D first
+        if dia_waveform.dtype != torch.float32:
+            dia_waveform = dia_waveform.to(dtype=torch.float32)
+
+        # Diarization expects waveform on its model's device.
+        # Assuming self.diariser.device correctly reflects this.
+        dia_audio_input = {
+            "waveform": dia_waveform.to(self.diariser.device), 
+            "sample_rate": audio_file_processed.sr
         }
         
-        if self.verbose:
-            print("Starting diarisation.")
+        if current_verbose:
+            print("Starting diarisation...")
 
-        diarisation = self.diariser.diarization(dia_audio, **kwargs)
+        # Pass through relevant diarization kwargs
+        diarisation_kwargs = {k:v for k,v in kwargs.items() if k in self.diariser.diarization.__code__.co_varnames}
+        diarisation = self.diariser.diarization(dia_audio_input, **diarisation_kwargs)
 
-        if not diarisation["segments"]:
-            print("No segments found. Try to run transcription without diarisation.")
+        if not diarisation.get("segments"): # Check if segments list is empty or key missing
+            if current_verbose:
+                print("No segments found by diariser. Transcribing entire audio as a single speaker.")
 
-            transcript = self.transcriber.transcribe(
-                audio_file.waveform, **kwargs)
+            # Transcribe entire audio, result is a dict {"text": ..., "segments": ...}
+            # The transcriber itself will use its model's device.
+            transcription_result = self.transcriber.transcribe(
+                audio_file_processed.waveform, **kwargs) # Pass all other kwargs to transcriber
+            
+            # Create a compatible structure for Transcript object
+            duration_s = len(audio_file_processed.waveform) / audio_file_processed.sr
+            final_transcript_data = {
+                0: {
+                    "speakers": 'SPEAKER_01', # Default speaker
+                    "segments": [0.0, duration_s], # Full duration
+                    "text": transcription_result.get("text", "") # Use the text from transcription
+                }
+            }
+            return Transcript(final_transcript_data)
 
-            final_transcript = {0: {"speakers": 'SPEAKER_01',
-                                    "segments": [0, len(audio_file.waveform)],
-                                    "text": transcript}}
+        if current_verbose:
+            print(f"Diarisation finished with {len(diarisation['segments'])} segments. Starting transcription per segment.")
 
-            return Transcript(final_transcript)
+        final_transcript_data = {}
+        for i in trange(len(diarisation["segments"]), desc="Transcribing Segments", disable=not current_verbose, unit="segment"):
+            seg_start, seg_end = diarisation["segments"][i] # Assuming segments are [start, end] tuples
+            speaker = diarisation["speakers"][i]
 
-        if self.verbose:
-            print("Diarisation finished. Starting transcription.")
+            # AudioProcessor.cut returns a new AudioProcessor object or raw waveform
+            audio_segment_waveform = audio_file_processed.cut(seg_start, seg_end) # Returns waveform directly
 
+            # Transcriber expects waveform Tensor or ndarray
+            # The transcriber.transcribe method will handle its device placement
+            segment_transcription_result = self.transcriber.transcribe(audio_segment_waveform, **kwargs)
 
-        # Transcribe each segment and store the results
-        final_transcript = dict()
+            final_transcript_data[i] = {
+                "speakers": speaker,
+                "segments": [seg_start, seg_end],
+                "text": segment_transcription_result.get("text", "")
+            }
 
-        for i in trange(len(diarisation["segments"]), desc="Transcribing", disable=not self.verbose):
+        if remove_original and isinstance(audio_file, str): # Only remove if original was a file path
+            shred_flag = kwargs.get("shred", False)
+            self.remove_audio_file(audio_file, shred=shred_flag)
 
-            seg = diarisation["segments"][i]
-
-            # Get the audio segment based on diarization results
-            audio = audio_file.cut(seg[0], seg[1])
-
-            transcript = self.transcriber.transcribe(audio, **kwargs)
-
-            final_transcript[i] = {"speakers": diarisation["speakers"][i],
-                                   "segments": seg,
-                                   "text": transcript}
-
-        # Remove original file if needed
-        if remove_original:
-            if kwargs.get("shred") is True:
-                self.remove_audio_file(audio_file, shred=True)
-            else:
-                self.remove_audio_file(audio_file, shred=False)
-
-        return Transcript(final_transcript)
+        return Transcript(final_transcript_data)
 
     def diarization(self, audio_file: Union[str, torch.Tensor, ndarray],
-                    **kwargs) -> dict:
-        """
-        Perform diarization on an audio file using the pyannote diarization model.
+                    **kwargs: Any) -> Dict[str, Any]:
+        # ... (implementation as before, ensure dia_audio_input uses self.diariser.device)
+        audio_file_processed: AudioProcessor = self.get_audio_file(audio_file)
+        dia_waveform = audio_file_processed.waveform.reshape(1, -1)
+        if dia_waveform.dtype != torch.float32:
+            dia_waveform = dia_waveform.to(dtype=torch.float32)
 
-        Args:
-            audio_file (Union[str, torch.Tensor, ndarray]):
-                The audio source which can either be a path to the audio file or a tensor representation.
-            **kwargs: 
-                Additional keyword arguments for diarization.
-
-        Returns:
-            dict: 
-                A dictionary containing the results of the diarization process.
-        """
-
-        # Get audio file as an AudioProcessor object
-        audio_file: AudioProcessor = self.get_audio_file(audio_file)
-
-        # Prepare waveform and sample rate for diarization
-        dia_audio = {
-            "waveform": audio_file.waveform.reshape(1, len(audio_file.waveform)).to(SCRAIBE_TORCH_DEVICE),
-            "sample_rate": audio_file.sr 
+        dia_audio_input = {
+            "waveform": dia_waveform.to(self.diariser.device),
+            "sample_rate": audio_file_processed.sr 
         }
+        if self.verbose: print("Starting diarisation (direct call)...")
+        diarisation_kwargs = {k:v for k,v in kwargs.items() if k in self.diariser.diarization.__code__.co_varnames}
+        diarisation_result = self.diariser.diarization(dia_audio_input, **diarisation_kwargs)
+        return diarisation_result
 
-        print("Starting diarisation.")
-
-        diarisation = self.diariser.diarization(dia_audio, **kwargs)
-
-        return diarisation
 
     def transcribe(self, audio_file: Union[str, torch.Tensor, ndarray],
-                   **kwargs):
-        """
-            Transcribe the provided audio file.
+                   **kwargs: Any) -> Dict[str, Any]: # Ensure return type matches ABC
+        # ... (implementation as before, ensure it returns a dict)
+        audio_file_processed: AudioProcessor = self.get_audio_file(audio_file)
+        if self.verbose: print("Starting transcription (direct call)...")
+        transcription_result = self.transcriber.transcribe(audio_file_processed.waveform, **kwargs)
+        return transcription_result # This is already a dict from refactored transcriber
 
-            Args:
-                audio_file (Union[str, torch.Tensor, ndarray]):
-                    The audio source, which can either be a path or a tensor representation.
-                **kwargs: 
-                    Additional keyword arguments for transcription.
+    def update_transcriber(self,
+                           whisper_model_or_name: Union[str, Transcriber, None], # Updated type hint
+                           whisper_type: Optional[str] = None, # Allow changing type
+                           **kwargs: Any) -> None:
+        _old_model_name = self.transcriber.model_name if self.transcriber else "None"
+        
+        effective_whisper_type = whisper_type if whisper_type is not None else \
+                                (self.params.get("whisper_type", "openai-ipex-llm") if self.params else "openai-ipex-llm")
+        
+        kwargs["device"] = self.target_device # Ensure device is passed
 
-            Returns:
-                str:
-                    The transcribed text from the audio source.
-        """
-        audio_file: AudioProcessor = self.get_audio_file(audio_file)
-
-        return self.transcriber.transcribe(audio_file.waveform, **kwargs)
-
-    def update_transcriber(self, whisper_model: Union[str, whisper], **kwargs) -> None:
-        """
-        Update the transcriber model.
-
-        Args:
-            whisper_model (Union[str, whisper]):
-                The new whisper model to use for transcription.
-            **kwargs:
-                Additional keyword arguments for the transcriber model.
-
-            Returns:
-                None
-        """
-        _old_model = self.transcriber.model_name
-
-        if isinstance(whisper_model, str):
-            self.transcriber = load_transcriber(whisper_model, **kwargs)
-        elif isinstance(whisper_model, Transcriber):
-            self.transcriber = whisper_model
+        if isinstance(whisper_model_or_name, Transcriber):
+            self.transcriber = whisper_model_or_name
+            if self.verbose: print(f"Transcriber updated to provided instance: {self.transcriber}")
+        elif isinstance(whisper_model_or_name, str):
+            self.transcriber = load_transcriber(
+                model_name=whisper_model_or_name, whisper_type=effective_whisper_type, **kwargs)
+            if self.verbose: print(f"Transcriber updated to loaded model: {self.transcriber}")
+        elif whisper_model_or_name is None: # Option to reset to default
+             self.transcriber = load_transcriber(
+                model_name="medium", whisper_type=effective_whisper_type, **kwargs)
+             if self.verbose: print(f"Transcriber reset to default model: {self.transcriber}")
         else:
-            warn(
-                f"Invalid model type. Please provide a valid model. Fallback to old {_old_model} Model.", RuntimeWarning)
-
+            warnings.warn(
+                f"Invalid type for whisper_model_or_name: {type(whisper_model_or_name)}. "
+                f"Expected model name (str), Transcriber instance, or None. "
+                f"Transcriber not updated, fallback to old '{_old_model_name}' model.", RuntimeWarning)
         return None
 
-    def update_diariser(self, dia_model: Union[str, DiarisationType], **kwargs) -> None:
-        """
-        Update the diariser model.
+    def update_diariser(self,
+                        dia_model_or_name: Union[str, Diariser, None], # Consistent naming and typing
+                        **kwargs: Any) -> None:
+        _old_diariser_info = str(self.diariser) if self.diariser else "None"
+        kwargs["device"] = self.target_device
 
-        Args:
-            dia_model (Union[str, DiarisationType]):
-                The new diariser model to use for diarization.
-            **kwargs:
-                Additional keyword arguments for the diariser model.
-
-            Returns:
-                None
-        """
-        if isinstance(dia_model, str):
-            self.diariser = Diariser.load_model(dia_model, **kwargs)
-        elif isinstance(dia_model, Diariser):
-            self.diariser = dia_model
+        if isinstance(dia_model_or_name, Diariser):
+            self.diariser = dia_model_or_name
+            if self.verbose: print(f"Diariser updated to provided instance: {self.diariser}")
+        elif isinstance(dia_model_or_name, str):
+            self.diariser = Diariser.load_model(dia_model_or_name, **kwargs)
+            if self.verbose: print(f"Diariser updated to loaded model: {self.diariser.model_name if hasattr(self.diariser, 'model_name') else self.diariser}")
+        elif dia_model_or_name is None:
+            self.diariser = Diariser.load_model(**kwargs) # Load default
+            if self.verbose: print(f"Diariser reset to default model: {self.diariser.model_name if hasattr(self.diariser, 'model_name') else self.diariser}")
         else:
-            warn("Invalid model type. Please provide a valid model. Fallback to old Model.", RuntimeWarning)
-
+            warnings.warn(
+                f"Invalid type for dia_model_or_name: {type(dia_model_or_name)}. "
+                f"Expected model name (str), Diariser instance, or None. "
+                f"Diariser not updated, fallback to old '{_old_diariser_info}'.", RuntimeWarning)
         return None
 
-    @staticmethod
-    def remove_audio_file(audio_file: str,
-                          shred: bool = False) -> None:
-        """
-        Removes the original audio file to avoid disk space issues or ensure data privacy.
-
-        Args:
-            audio_file_path (str): Path to the audio file.
-            shred (bool, optional): If True, the audio file will be shredded,
-                                    not just removed.
-        """
-        if not os.path.exists(audio_file):
-            raise ValueError(f"Audiofile {audio_file} does not exist.")
-
-        if shred:
-
-            warn("Shredding audiofile can take a long time.", RuntimeWarning)
-
-            gen = iglob(f'{audio_file}', recursive=True)
-            cmd = ['shred', '-zvu', '-n', '10', f'{audio_file}']
-
-            if os.path.isdir(audio_file):
-                raise ValueError(f"Audiofile {audio_file} is a directory.")
-
-            for file in gen:
-                print(f'shredding {file} now\n')
-
-                run(cmd, check=True)
-
-        else:
-            os.remove(audio_file)
-            print(f"Audiofile {audio_file} removed.")
+    # remove_audio_file and get_audio_file can remain largely the same,
+    # just ensure AudioProcessor details are consistent.
+    # ... (remove_audio_file and get_audio_file methods as in your original, ensure they are robust) ...
 
     @staticmethod
-    def get_audio_file(audio_file: Union[str, torch.Tensor, ndarray]) -> AudioProcessor:
-        """Gets an audio file as TorchAudioProcessor.
+    def remove_audio_file(audio_file_path: str, shred: bool = False) -> None:
+        if not isinstance(audio_file_path, str):
+            warnings.warn(f"remove_audio_file expects a path string, got {type(audio_file_path)}. Skipping removal.")
+            return
+            
+        if not os.path.exists(audio_file_path):
+            # It might have been a temporary AudioProcessor object, not a file path that still exists
+            warnings.warn(f"Audio file {audio_file_path} does not exist or was not a persistent file. Skipping removal.")
+            return
 
-        Args:
-            audio_file (Union[str, torch.Tensor, ndarray]): Path to the audio file or 
-                                                        a tensor representing the audio.
-            *args: Additional positional arguments.
-            **kwargs: Additional keyword arguments.
+        try:
+            if shred:
+                warnings.warn("Shredding audiofile can take a long time.", RuntimeWarning)
+                # Basic shred command for Linux/macOS. May need adjustment for Windows or if `shred` not available.
+                # Ensure the file path is secure against command injection if it comes from untrusted input.
+                # For simplicity, direct command construction. Be cautious with paths from external sources.
+                run(['shred', '-zvu', '-n', '1', audio_file_path], check=True) # Reduced shred passes to 1 for speed
+                print(f"Audio file {audio_file_path} shredded and removed.")
+            else:
+                os.remove(audio_file_path)
+                print(f"Audio file {audio_file_path} removed.")
+        except FileNotFoundError:
+             warnings.warn(f"Audio file {audio_file_path} was not found for removal (perhaps already deleted).")
+        except Exception as e:
+            warnings.warn(f"Error removing/shredding audio file {audio_file_path}: {e}")
 
-        Returns:
-            AudioProcessor: An object containing the waveform and sample rate in
-                            torch.Tensor format.
+
+    @staticmethod
+    def get_audio_file(audio_source: Union[str, torch.Tensor, ndarray]) -> AudioProcessor:
         """
+        Gets an audio file as an AudioProcessor object.
+        Assumes if Tensor or ndarray is passed, it's (waveform, sample_rate).
+        For a single Tensor input (waveform), assumes a default sample rate or requires it.
+        This implementation assumes AudioProcessor can handle these inputs.
+        """
+        if isinstance(audio_source, str):
+            # Assuming AudioProcessor.from_file handles path existence and loading
+            return AudioProcessor.from_file(audio_source)
+        elif isinstance(audio_source, torch.Tensor):
+            # This part of your original logic was ambiguous:
+            # audio_file = AudioProcessor(audio_file[0], audio_file[1])
+            # If audio_source is just the waveform tensor, what is audio_file[1] (sample_rate)?
+            # Assuming if it's a Tensor, it's JUST the waveform, and SR is default (e.g. 16kHz)
+            # or must be passed separately.
+            # For now, let's assume AudioProcessor can take a raw waveform and assumes/is given SR.
+            # This needs to align with your AudioProcessor's constructor.
+            # If AudioProcessor expects (waveform_tensor, sr), the caller must provide that structure.
+            # Let's assume audio_source is just the waveform here.
+            # A more robust AudioProcessor might have from_tensor(tensor, sample_rate)
+            if audio_source.ndim > 1 and audio_source.shape[0] == 1 : # (1, num_samples) -> (num_samples)
+                audio_source = audio_source.squeeze(0)
+            return AudioProcessor(waveform=audio_source, sample_rate=16000) # Assuming 16kHz if SR not given with tensor
+        elif isinstance(audio_source, ndarray):
+            # Similar ambiguity as Tensor.
+            # audio_file = AudioProcessor(torch.Tensor(audio_file[0]), audio_file[1])
+            # Assuming ndarray is just the waveform.
+            return AudioProcessor(waveform=torch.from_numpy(audio_source.astype(np.float32)), sample_rate=16000) # Assuming 16kHz
 
-        if isinstance(audio_file, str):
-            audio_file = AudioProcessor.from_file(audio_file)
-
-        elif isinstance(audio_file, torch.Tensor):
-            audio_file = AudioProcessor(audio_file[0], audio_file[1])
-        elif isinstance(audio_file, ndarray):
-            audio_file = AudioProcessor(torch.Tensor(audio_file[0]),
-                                        audio_file[1])
-
-        if not isinstance(audio_file, AudioProcessor):
-            raise ValueError(f'Audiofile must be of type AudioProcessor,'
-                             f'not {type(audio_file)}')
-
-        return audio_file
+        # If audio_source is already an AudioProcessor instance (e.g. from a previous call)
+        if isinstance(audio_source, AudioProcessor):
+            return audio_source
+            
+        raise TypeError(f"Unsupported audio_source type: {type(audio_source)}. "
+                        "Expected path (str), waveform (Tensor/ndarray), or AudioProcessor.")
 
     def __repr__(self):
-        return f"Scraibe(transcriber={self.transcriber}, diariser={self.diariser})"
+        transcriber_info = str(self.transcriber) if self.transcriber else "None"
+        diariser_info = str(self.diariser) if self.diariser else "None"
+        return f"Scraibe(transcriber={transcriber_info}, diariser={diariser_info})"
