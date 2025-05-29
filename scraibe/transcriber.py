@@ -32,6 +32,8 @@ from faster_whisper.tokenizer import _LANGUAGE_CODES as FASTER_WHISPER_LANGUAGE_
 from typing import TypeVar, Union, Optional
 from torch import Tensor, device
 from numpy import ndarray
+from typing import Any, Dict, List, Tuple, Callable
+import torch.nn.functional as F
 from inspect import signature
 from abc import abstractmethod
 from transformers.utils import ModelOutput
@@ -240,26 +242,26 @@ class WhisperTranscriber(Transcriber):
         return text
 
     # Helper functions and whisper_generate copied from utils.py
- def _extract_past_from_model_output(
- self, outputs: ModelOutput, standardize_cache_format: bool = False
- ):
- past_key_values = None
- cache_name = "past_key_values"
- # To use torch.jit.trace, the output is no longer a Dict. outputs[1] corresponds to "past_key_values"
- if hasattr(self, "trace_graph"):
- past_key_values = outputs[1]
- if "past_key_values" in outputs:
- past_key_values = outputs.past_key_values
- elif "mems" in outputs:
- past_key_values = outputs.mems
- elif "past_buckets_states" in outputs:
- past_key_values = outputs.past_buckets_states
- elif "cache_params" in outputs:
- past_key_values = outputs.cache_params
- cache_name = "cache_params"
+    def _extract_past_from_model_output(
+        self, outputs: ModelOutput, standardize_cache_format: bool = False
+    ):
+        past_key_values = None
+        cache_name = "past_key_values"
+        # To use torch.jit.trace, the output is no longer a Dict. outputs[1] corresponds to "past_key_values"
+        if hasattr(self, "trace_graph"):
+            past_key_values = outputs[1]
+        if "past_key_values" in outputs:
+            past_key_values = outputs.past_key_values
+        elif "mems" in outputs:
+            past_key_values = outputs.mems
+        elif "past_buckets_states" in outputs:
+            past_key_values = outputs.past_buckets_states
+        elif "cache_params" in outputs:
+            past_key_values = outputs.cache_params
+        cache_name = "cache_params"
 
- # Bloom fix: standardizes the cache format when requested
- if standardize_cache_format and hasattr(self, "_convert_to_standard_cache"):
+        # Bloom fix: standardizes the cache format when requested
+        if standardize_cache_format and hasattr(self, "_convert_to_standard_cache"):
  batch_size = outputs.logits.shape[0]
  past_key_values = self._convert_to_standard_cache(
  past_key_values, batch_size=batch_size
@@ -268,12 +270,12 @@ class WhisperTranscriber(Transcriber):
  return past_key_values
  return cache_name, past_key_values
  
- def _update_model_kwargs_for_generation(
- self,
- outputs: ModelOutput,
- model_kwargs: Dict[str, Any],
- is_encoder_decoder: bool = False,
- standardize_cache_format: bool = False,
+    def _update_model_kwargs_for_generation(
+        self,
+        outputs: ModelOutput,
+        model_kwargs: Dict[str, Any],
+        is_encoder_decoder: bool = False,
+        standardize_cache_format: bool = False,
  num_new_tokens: int = 1,
  ) -> Dict[str, Any]:
 
@@ -338,13 +340,13 @@ class WhisperTranscriber(Transcriber):
 
  return model_kwargs
  
- def _get_attr_from_logit_processors(
- logits_processor, logit_processor_class, attribute_name
- ):
- logit_processor = next(
- (cls for cls in logits_processor if isinstance(cls, logit_processor_class)),
- None,
- )
+    def _get_attr_from_logit_processors(
+        logits_processor, logit_processor_class, attribute_name
+    ):
+        logit_processor = next(
+            (cls for cls in logits_processor if isinstance(cls, logit_processor_class)),
+            None,
+        )
  if logit_processor:
  return getattr(logit_processor, attribute_name, None)
  return None
@@ -466,13 +468,13 @@ class WhisperTranscriber(Transcriber):
  else:
  return sequences
  
- def whisper_generate(
- self,
- input_features: Optional[torch.Tensor] = None,
- generation_config=None,
- logits_processor=None,
- stopping_criteria=None,
- prefix_allowed_tokens_fn: Optional[Callable[[int, torch.Tensor], List[int]]] = None,
+    def whisper_generate(
+        self,
+        input_features: Optional[torch.Tensor] = None,
+        generation_config=None,
+        logits_processor=None,
+        stopping_criteria=None,
+        prefix_allowed_tokens_fn: Optional[Callable[[int, torch.Tensor], List[int]]] = None,
  synced_gpus: bool = False,
  return_timestamps: Optional[bool] = None,
  task: Optional[str] = None,
