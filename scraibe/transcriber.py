@@ -262,10 +262,10 @@ class WhisperTranscriber(Transcriber):
 
         # Bloom fix: standardizes the cache format when requested
         if standardize_cache_format and hasattr(self, "_convert_to_standard_cache"):
- batch_size = outputs.logits.shape[0]
- past_key_values = self._convert_to_standard_cache(
+            batch_size = outputs.logits.shape[0]
+            past_key_values = self._convert_to_standard_cache(
  past_key_values, batch_size=batch_size
- )
+            )
  if version.parse(transformers.__version__) < version.parse("4.42.0"):
  return past_key_values
  return cache_name, past_key_values
