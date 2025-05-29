@@ -35,9 +35,6 @@ from numpy import ndarray
 from inspect import signature
 from abc import abstractmethod
 from transformers.utils import ModelOutput
-from transformers import (
- ModelOutput,
-)
 import transformers
 from packaging import version
 
@@ -221,17 +218,16 @@ class WhisperTranscriber(Transcriber):
         # If whisper_generate returns something else, this part will need adjustment.
 
         if isinstance(result, dict) and 'sequences' in result:
-            
- # Assuming self.model has a tokenizer attribute
- if hasattr(self.model, 'tokenizer'):
- # Decode the token IDs. Assuming sequences is a tensor of token IDs.
- # This might need adjustment based on the shape and content of result['sequences']
- text = self.model.tokenizer.batch_decode(result['sequences'], skip_special_tokens=True)
- # If it's a list of sequences, join them or handle appropriately
- if isinstance(text, list):
- text = " ".join(text) # Example: join multiple sequences
- else:
- # Handle cases where the output structure is different
+
+            # Assuming self.model has a tokenizer attribute
+            if hasattr(self.model, 'tokenizer'):
+                # Decode the token IDs. Assuming sequences is a tensor of token IDs.
+                # This might need adjustment based on the shape and content of result['sequences']
+                text = self.model.tokenizer.batch_decode(result['sequences'], skip_special_tokens=True)
+            # If it's a list of sequences, join them or handle appropriately
+            if isinstance(text, list):
+                text = " ".join(text) # Example: join multiple sequences
+            else:
  warnings.warn("Expected 'sequences' in whisper_generate result, but the structure is different. Returning raw result.")
  text = str(result) # Return string representation as a fallback
  else:
@@ -244,7 +240,6 @@ class WhisperTranscriber(Transcriber):
         return text
 
     # Helper functions and whisper_generate copied from utils.py
- @staticmethod
  def _extract_past_from_model_output(
  self, outputs: ModelOutput, standardize_cache_format: bool = False
  ):
@@ -272,8 +267,7 @@ class WhisperTranscriber(Transcriber):
  if version.parse(transformers.__version__) < version.parse("4.42.0"):
  return past_key_values
  return cache_name, past_key_values
-
- @staticmethod
+ 
  def _update_model_kwargs_for_generation(
  self,
  outputs: ModelOutput,
@@ -343,8 +337,7 @@ class WhisperTranscriber(Transcriber):
  )
 
  return model_kwargs
-
- @staticmethod
+ 
  def _get_attr_from_logit_processors(
  logits_processor, logit_processor_class, attribute_name
  ):
@@ -355,8 +348,7 @@ class WhisperTranscriber(Transcriber):
  if logit_processor:
  return getattr(logit_processor, attribute_name, None)
  return None
-
- @staticmethod
+ 
  def _pad_to_max_length(
  current_segments,
  pad_token_id,
@@ -473,8 +465,7 @@ class WhisperTranscriber(Transcriber):
  return sequences, token_timestamps
  else:
  return sequences
-
- @staticmethod
+ 
  def whisper_generate(
  self,
  input_features: Optional[torch.Tensor] = None,
