@@ -349,8 +349,8 @@ class FasterWhisperTranscriber(Transcriber):
             
         compute_type = kwargs.get('compute_type', 'float16')
         if device == 'cpu' and compute_type == 'float16':
-            warnings.warn(f'Compute type {compute_type} not compatible with '
- f'device {device}! Changing compute type to int8.') compute_type = 'int8'
+            warnings.warn(f'Compute type {compute_type} not compatible with device {device}! Changing compute type to int8.')
+            compute_type = 'int8'
         _model = FasterWhisperModel(model, download_root=download_root,
                                     device=device, compute_type=compute_type, 
                                     cpu_threads=SCRAIBE_NUM_THREADS)
