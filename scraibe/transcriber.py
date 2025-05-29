@@ -225,16 +225,16 @@ class WhisperTranscriber(Transcriber):
                 # This might need adjustment based on the shape and content of result['sequences']
                 text = self.model.tokenizer.batch_decode(result['sequences'], skip_special_tokens=True)
             # If it's a list of sequences, join them or handle appropriately
-            if isinstance(text, list):
-                text = " ".join(text) # Example: join multiple sequences
+                if isinstance(text, list):
+                    text = " ".join(text) # Example: join multiple sequences
+                else:
+                    warnings.warn("Expected 'sequences' in whisper_generate result, but the structure is different. Returning raw result.")
+                    text = str(result) # Return string representation as a fallback
             else:
- warnings.warn("Expected 'sequences' in whisper_generate result, but the structure is different. Returning raw result.")
- text = str(result) # Return string representation as a fallback
- else:
- warnings.warn("Model does not have a tokenizer. Cannot decode sequences. Returning raw result.")
- text = str(result) # Return string representation as a fallback
- else:
- warnings.warn("Expected a dictionary result from whisper_generate. Returning raw result.")
+                warnings.warn("Model does not have a tokenizer. Cannot decode sequences. Returning raw result.")
+                text = str(result) # Return string representation as a fallback
+        else:
+            warnings.warn("Expected a dictionary result from whisper_generate. Returning raw result.")
             text = str(result) # Return string representation as a fallback
 
         return text
