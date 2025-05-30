@@ -191,7 +191,7 @@ class Diariser:
                    cache_dir: Union[Path, str] = PYANNOTE_DEFAULT_PATH,
                    hparams_file: Union[str, Path] = None,
                    device: str = SCRAIBE_TORCH_DEVICE,
-                   ) -> Diariser:
+                   ) -> 'Diariser':
         """
         Loads a pretrained model from pyannote.audio, 
         either from a local cache or some online repository.
