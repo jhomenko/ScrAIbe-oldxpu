@@ -102,7 +102,10 @@ class Scraibe:
         elif isinstance(dia_model_or_name, str):
             self.diariser = Diariser.load_model(dia_model_or_name, device=self.target_device, **kwargs)
         elif dia_model_or_name is None:
-            self.diariser = Diariser.load_model(device=self.target_device, **kwargs) # Default diariser model
+            #self.diariser = Diariser.load_model(device=self.target_device, **kwargs) # Default diariser model
+            kwargs_for_diariser = kwargs.copy()
+            kwargs_for_diariser.pop('device', None) # Safely remove 'device' key if it exists in kwargs
+            self.diariser = Diariser.load_model(device=self.target_device, **kwargs_for_diariser)
         else:
             raise TypeError(f"Unsupported type for dia_model_or_name: {type(dia_model_or_name)}. "
                             "Expected model name (str), Diariser instance, or None.")

@@ -188,39 +188,76 @@ class OpenAIWhisperIPEXLLMTranscriber(Transcriber):
                    ) -> 'OpenAIWhisperIPEXLLMTranscriber':
 
         target_device = torch.device(device_option if device_option else SCRAIBE_TORCH_DEVICE)
+        
+        # Determine the initial device for loading the model
+        initial_load_device = target_device
+        
+        # Condition for performing IPEX-LLM XPU optimization
+        perform_ipex_xpu_optimization = (use_ipex_llm and 
+                                         ipex_llm is not None and 
+                                         target_device.type == 'xpu')
 
-        print(f"Loading OpenAI Whisper model: '{model_name}' for device: '{target_device}'")
-        _model = openai_whisper_load_model(name=model_name, # `name` is the arg for openai_whisper_load_model
+        if perform_ipex_xpu_optimization:
+            # For IPEX-LLM XPU optimization, we must load the model to CPU first
+            initial_load_device = torch.device('cpu')
+            print(f"Loading OpenAI Whisper model: '{model_name}' to CPU for IPEX-LLM XPU optimization.")
+        else:
+            print(f"Loading OpenAI Whisper model: '{model_name}' for device: '{target_device}'.")
+
+        # Load the model using the determined initial_load_device
+        _model = openai_whisper_load_model(name=model_name,
                                            download_root=download_root,
-                                           device=target_device,
+                                           device=initial_load_device, # Load to CPU if optimizing for XPU, else target_device
                                            in_memory=in_memory)
+        
+        print(f"Model '{model_name}' initially loaded on device: {_model.device}")
 
-        if use_ipex_llm and ipex_llm is not None and target_device.type == 'xpu':
-            print(f"Attempting IPEX-LLM optimization for OpenAI Whisper model with low_bit='{low_bit}'...")
+        if perform_ipex_xpu_optimization:
+            print(f"Attempting IPEX-LLM optimization for OpenAI Whisper model (currently on {_model.device}) with low_bit='{low_bit}'...")
             try:
-                # Ensure model is on the XPU device if not already
-                if str(_model.device) != str(target_device): # Compare string representations
-                    _model.to(target_device)
-                
-                # From IPEX-LLM docs: optimize_model(model, low_bit=..., optimize_llm=True, ...)
-                # optimize_llm=True is default, check if beneficial for Whisper.
-                # cpu_embedding=True might be useful in some XPU scenarios.
+                # Ensure model is on CPU before optimization (should be if initial_load_device was 'cpu')
+                if _model.device.type != 'cpu':
+                    _model = _model.to('cpu')
+                    print(f"Moved model to CPU for optimization. Current device: {_model.device}")
+
                 _model = ipex_llm.optimize_model(_model,
                                                  low_bit=low_bit,
-                                                 optimize_llm=True, 
-                                                 # cpu_embedding=True, # Optional: experiment with this
-                                                 # Pass other relevant kwargs from optimize_model if needed
+                                                 optimize_llm=True, # Default, good for Whisper
+                                                 # cpu_embedding=True, # Optional: experiment if OOM issues on XPU
                                                  )
-                print(f"IPEX-LLM optimization applied. Effective model device: {_model.device}, Target low-bit: {low_bit}")
+                print(f"IPEX-LLM optimization successful. Optimized model is on device: {_model.device}")
+                
+                # After successful optimization, move the model to the target XPU device
+                print(f"Moving optimized model to target device: {target_device}...")
+                _model = _model.to(target_device)
+                print(f"Model is now on device: {_model.device}")
+
             except Exception as e:
-                warnings.warn(f"IPEX-LLM optimization failed for OpenAI Whisper model: {e}")
-        elif use_ipex_llm and ipex_llm is None:
-            warnings.warn("IPEX-LLM library not found. Skipping IPEX-LLM optimization.")
-        elif use_ipex_llm and target_device.type != 'xpu':
-            warnings.warn(f"IPEX-LLM optimization skipped: Target device is '{target_device.type}', not 'xpu'.")
-
+                warnings.warn(f"IPEX-LLM optimization failed for OpenAI Whisper model: {e}. Model remains on {_model.device}.")
+                # If optimization fails, the model is likely still the CPU version.
+                # Move it to the target_device (XPU) anyway so the rest of the application can proceed.
+                if str(_model.device) != str(target_device):
+                    try:
+                        _model = _model.to(target_device)
+                        warnings.warn(f"Model (post-failed-optimization) moved to {target_device}. Current device: {_model.device}")
+                    except Exception as move_e:
+                        warnings.warn(f"Could not move model to {target_device} after failed optimization: {move_e}")
+        
+        elif use_ipex_llm: # IPEX-LLM was desired but conditions not met for XPU optimization
+            if ipex_llm is None:
+                warnings.warn("IPEX-LLM library not found. Skipping IPEX-LLM optimization.")
+            elif target_device.type != 'xpu':
+                warnings.warn(f"IPEX-LLM optimization skipped: Target device is '{target_device.type}', not 'xpu'.")
+        
+        # If no IPEX XPU optimization was performed, or if it failed and model was moved,
+        # ensure model is on the final target_device if it's not already.
+        if str(_model.device) != str(target_device):
+            print(f"Ensuring model is on final target device {target_device}. Current: {_model.device}")
+            _model = _model.to(target_device)
+            print(f"Model finally on device: {_model.device}")
+            
         return cls(model_name, _model)
-
+        
     def transcribe(self, audio: Union[str, Tensor, ndarray], **kwargs: Any) -> Dict[str, Any]:
         """
         Transcribe using the OpenAI Whisper model (potentially IPEX-LLM optimized).
