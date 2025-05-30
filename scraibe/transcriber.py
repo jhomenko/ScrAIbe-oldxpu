@@ -197,93 +197,94 @@ class OpenAIWhisperIPEXLLMTranscriber(Transcriber):
     @classmethod
     def load_model(cls,
                    model_name: str = "medium",
-                   download_root: Optional[str] = None,
+                   download_root: Optional[str] = None, 
                    device_option: Optional[Union[str, torch.device]] = None,
-                   use_ipex_llm: bool = True, # This class is specifically for IPEX-LLM
-                   low_bit: str = 'bf16',    # Default low_bit for this XPU-focused class
+                   use_ipex_llm: bool = True,
+                   low_bit: str = 'bf16',
                    use_auth_token: Optional[str] = None,
-                   in_memory: bool = False, # Not directly used by AutoModelForSpeechSeq2Seq.from_pretrained
-                                            # but kept for signature compatibility if load_transcriber passes it.
-                   **kwargs: Any # Catches other potential args like 'trust_remote_code'
+                   in_memory: bool = False, # Kept for signature compatibility
+                   **kwargs: Any 
                    ) -> 'OpenAIWhisperIPEXLLMTranscriber':
 
         if not use_ipex_llm:
-            # This class is intended for IPEX-LLM usage.
-            # If use_ipex_llm is False, it implies a different loading strategy or class should be used.
-            # For now, we proceed assuming IPEX-LLM is desired for this transcriber type.
             warnings.warn("OpenAIWhisperIPEXLLMTranscriber is intended for use_ipex_llm=True. "
                           "Proceeding with IPEX-LLM loading.", UserWarning)
 
-        if ipex_llm is None:
+        if ipex_llm is None: # Ensure ipex_llm is imported and checked at module level
             raise ImportError("IPEX-LLM library not found, cannot use OpenAIWhisperIPEXLLMTranscriber.")
 
-        target_device_str = str(device_option if device_option else SCRAIBE_TORCH_DEVICE)
+        target_device_str = str(device_option if device_option else SCRAIBE_TORCH_DEVICE) # Use your constants
         target_device = torch.device(target_device_str)
 
-        print(f"Loading Whisper model '{model_name}' using ipex_llm.transformers "
+        # --- Map short model names to full Hugging Face Hub identifiers ---
+        hf_model_id = model_name
+        # Common Whisper model sizes from OpenAI
+        official_short_names = ["tiny", "base", "small", "medium", "large", "large-v2", "large-v3"]
+        
+        # Check if model_name is a short name (e.g., "medium" or "tiny.en")
+        # and doesn't already look like a full path (e.g., "openai/whisper-medium")
+        potential_short_name = model_name.replace(".en", "") # Handle "tiny.en" -> "tiny" for the check
+        if potential_short_name in official_short_names and "/" not in model_name:
+            hf_model_id = f"openai/whisper-{model_name}"
+            print(f"Interpreted model_name '{model_name}' as Hugging Face ID '{hf_model_id}'")
+        # --- End mapping ---
+
+        print(f"Loading Whisper model '{hf_model_id}' using ipex_llm.transformers "
               f"with low_bit='{low_bit}' for device '{target_device_str}'")
 
-        # 1. Load WhisperProcessor from transformers
+        # 1. Load WhisperProcessor
         try:
             processor = WhisperProcessor.from_pretrained(
-                model_name,
+                hf_model_id, # Use mapped ID
                 cache_dir=download_root,
                 token=use_auth_token
             )
         except Exception as e:
-            warnings.warn(f"Failed to load WhisperProcessor for '{model_name}': {e}", RuntimeWarning)
+            warnings.warn(f"Failed to load WhisperProcessor for '{hf_model_id}': {e}", RuntimeWarning)
             raise
 
         # 2. Load model using ipex_llm.transformers.AutoModelForSpeechSeq2Seq
-        # Determine torch_dtype based on low_bit for explicit control if needed.
         torch_dtype_map = {
-            'bf16': torch.bfloat16,
-            'fp16': torch.float16,
-            'fp32': torch.float32, # Forcing fp32 if low_bit is None or 'fp32'
+            'bf16': torch.bfloat16, 'fp16': torch.float16, 'fp32': torch.float32,
         }
-        # If low_bit is like 'sym_int4', 'sym_int8', IPEX-LLM handles dtype internally with load_in_low_bit.
-        # For 'bf16'/'fp16', explicitly setting torch_dtype can be beneficial.
-        effective_torch_dtype = torch_dtype_map.get(low_bit.lower() if isinstance(low_bit, str) else "fp32", "auto") # Default to auto or fp32
-        if effective_torch_dtype == "auto" and low_bit not in ['bf16', 'fp16', 'fp32', None]: # if low_bit is a quant format like int4
-            effective_torch_dtype = None # Let IPEX-LLM handle it fully for int4/int8
+        effective_torch_dtype = torch_dtype_map.get(low_bit.lower() if isinstance(low_bit, str) else "fp32", "auto")
+        if effective_torch_dtype == "auto" and low_bit not in ['bf16', 'fp16', 'fp32', None]:
+            effective_torch_dtype = None 
 
         if target_device.type == 'cpu' and effective_torch_dtype == torch.float16:
-            warnings.warn("FP16 is not natively supported or optimal on CPU for some operations; IPEX-LLM might upcast. "
-                          "Consider 'bf16' if supported, or allow IPEX-LLM to manage dtype with 'load_in_low_bit'.")
+            warnings.warn("FP16 is not natively supported or optimal on CPU. "
+                          "IPEX-LLM might upcast or manage dtype with 'load_in_low_bit'.")
         
-        # Additional from_pretrained kwargs that might be useful or need to be exposed
         from_pretrained_kwargs = kwargs.copy()
-        from_pretrained_kwargs.setdefault('trust_remote_code', True) # Often needed for custom models/IPEX-LLM
+        from_pretrained_kwargs.setdefault('trust_remote_code', True)
 
         try:
-            # optimize_model=True and load_in_low_bit are key IPEX-LLM parameters
-            model = AutoModelForSpeechSeq2Seq.from_pretrained(
-                model_name,
+            model_instance = AutoModelForSpeechSeq2Seq.from_pretrained(
+                hf_model_id, # Use mapped ID
                 load_in_low_bit=low_bit,
-                optimize_model=True, # Recommended by IPEX-LLM benchmark
-                torch_dtype=effective_torch_dtype if effective_torch_dtype else "auto", # "auto" lets Transformers decide based on model config/precision
+                optimize_model=True,
+                torch_dtype=effective_torch_dtype if effective_torch_dtype else "auto",
                 cache_dir=download_root,
                 token=use_auth_token,
                 **from_pretrained_kwargs
             )
         except Exception as e:
-            warnings.warn(f"Failed to load model '{model_name}' using IPEX-LLM AutoModelForSpeechSeq2Seq: {e}", RuntimeWarning)
+            warnings.warn(f"Failed to load model '{hf_model_id}' using IPEX-LLM AutoModelForSpeechSeq2Seq: {e}", RuntimeWarning)
             raise
 
-        model = model.eval() # Set to evaluation mode
+        model_instance = model_instance.eval()
 
-        # Move model to the target device AFTER loading and optimization
         try:
-            model = model.to(target_device)
-            loaded_model_dtype = next(model.parameters()).dtype # Check actual dtype after loading and moving
-            print(f"IPEX-LLM Whisper model '{model_name}' loaded. Target device: '{target_device}'. "
+            model_instance = model_instance.to(target_device)
+            loaded_model_dtype = next(model_instance.parameters()).dtype
+            print(f"IPEX-LLM Whisper model '{hf_model_id}' loaded. Target device: '{target_device}'. "
                   f"Effective model dtype: {loaded_model_dtype}. Low-bit optimization: '{low_bit}'.")
         except Exception as e:
             warnings.warn(f"Failed to move IPEX-LLM loaded model to '{target_device}': {e}. "
-                          f"Model remains on its current device: {model.device}", RuntimeWarning)
-            target_device = model.device # Update target_device to the actual model device
+                          f"Model remains on its current device: {model_instance.device}", RuntimeWarning)
+            target_device = model_instance.device
 
-        return cls(model_name, model, processor, target_device, low_bit_format=low_bit)
+        return cls(hf_model_id, model_instance, processor, target_device, low_bit_format=low_bit)
 
     def transcribe(self, audio: Union[str, torch.Tensor, np.ndarray], **kwargs: Any) -> Dict[str, Any]:
         """
