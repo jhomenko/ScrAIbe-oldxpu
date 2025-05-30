@@ -202,7 +202,7 @@ def cli():
                 
                 print(f'Saving transcription to {save_path}')
                 with open(save_path, "w", encoding='utf-8') as f:
-                    f.write(out_dict.get("text", "")) # <--- Get the 'text' string from the dictionary
+                    f.write(out.get("text", "")) # <--- Get the 'text' string from the dictionary
     else:
         print("No audio files provided. Use the -f or --audio-files flag.")
 
