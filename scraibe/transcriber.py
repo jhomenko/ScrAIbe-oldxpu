@@ -343,337 +343,220 @@ class OpenAIWhisperIPEXLLMTranscriber(Transcriber):
 
     def transcribe(self, audio: Union[str, torch.Tensor, np.ndarray], **kwargs: Any) -> Dict[str, Any]:
         """
-        Transcribe long audio files using a windowed approach on the raw audio waveform,
-        with the IPEX-LLM loaded Whisper model.
+        Transcribe audio using the IPEX-LLM loaded Whisper model.
+        This version relies on the model's internal long-form processing capabilities
+        and timestamp generation.
         """
         if not self.processor or not self.model:
             raise RuntimeError("Transcriber is not properly initialized with a model and processor.")
 
-        self.verbose = kwargs.get("verbose", self.verbose)
+        if "verbose" in kwargs: self.verbose = kwargs["verbose"]
 
-        # ---- Parameter Setup from kwargs ----
-        temperature_option = kwargs.get("temperature", (0.0, 0.2, 0.4, 0.6, 0.8, 1.0))
-        temperatures = (temperature_option,) if isinstance(temperature_option, (float, int)) else tuple(temperature_option)
-        condition_on_previous_text = kwargs.get("condition_on_previous_text", True)
-        initial_prompt_str = kwargs.get("initial_prompt")
-        # For simplicity, full support for logprob_threshold, compression_ratio_threshold, no_speech_threshold
-        # in fallback logic is omitted but can be added if needed by analyzing generate output.
-        
-        generate_args_base = self._get_transcribe_kwargs(**kwargs) # Get common generate() args
-        generate_args_base.setdefault('use_cache', True)
-        # Remove temperature from base, as it's handled in the loop
-        generate_args_base.pop('temperature', None)
-
-
-        # ---- Audio Preprocessing: Ensure waveform is 1D float32 tensor ----
         if isinstance(audio, str):
-            raise NotImplementedError("This transcribe method expects a waveform Tensor. Path loading should be handled by Scraibe.")
+            raise NotImplementedError("This method expects a pre-processed waveform Tensor.")
         elif isinstance(audio, np.ndarray):
             audio_waveform = torch.from_numpy(audio.astype(np.float32))
         elif isinstance(audio, torch.Tensor):
             audio_waveform = audio.to(torch.float32)
         else:
-            raise TypeError(f"Expected audio to be str, Tensor, or ndarray, but got {type(audio)}")
+            raise TypeError(f"Expected audio to be Tensor or ndarray, got {type(audio)}")
 
         if audio_waveform.ndim > 1: audio_waveform = audio_waveform.squeeze()
         if audio_waveform.ndim != 1: raise ValueError(f"Audio waveform must be 1D, got {audio_waveform.ndim} dims.")
 
-        # ---- Language and Task Setup ----
-        language = kwargs.get("language", "en") # Default to 'en'
-        task = kwargs.get("task", "transcribe")
+        if self.verbose: print("Processing full audio with self.processor...")
+        try:
+            input_features = self.processor(
+                audio_waveform.cpu().numpy(), sampling_rate=SAMPLE_RATE, return_tensors="pt"
+            ).input_features
+        except Exception as e:
+            warnings.warn(f"Error during full audio feature extraction: {e}", RuntimeWarning)
+            raise
+
+        model_dtype = next(self.model.parameters()).dtype
+        if input_features.device != self.target_device:
+            input_features = input_features.to(self.target_device)
+        if input_features.dtype != model_dtype:
+            if self.verbose: print(f"Casting full_input_features to model dtype {model_dtype}")
+            input_features = input_features.to(model_dtype)
+
+        # Prepare options for model.generate, using defaults from _get_transcribe_kwargs
+        # and allowing overrides from **kwargs passed to this transcribe method.
+        generate_options = self._get_transcribe_kwargs(**kwargs)
         
-        # If language is not specified, robust detection requires a call to generate on the first chunk.
-        # This is complex to integrate here seamlessly without seeing the generated language token.
-        # For now, this implementation will rely on the provided 'language' or the model's default if 'language' is None
-        # when passed to processor.get_decoder_prompt_ids.
-        # The `openai-whisper` `transcribe` function has a dedicated `model.detect_language` call.
-        if language is None and self.model.config.is_multilingual:
-             if self.verbose: print("Language not specified. Relying on model's multilingual capability for first chunk, or processor default.")
-             # For more robust auto-detection, one would run a short `generate` on the first chunk
-             # with a generic prompt and inspect the predicted language token.
-             # This is omitted here for initial simplicity. Language will be what's used in the prompt.
+        # Language and task are key arguments for the model's generate method
+        # and are included by _get_transcribe_kwargs if passed in kwargs.
+        # If not, they default to None/transcribe inside _get_transcribe_kwargs,
+        # and the model's generate should handle auto-detection or its own defaults.
+        current_language = generate_options.get("language") # This will be None if not specified, for auto-detect
+        
+        if self.verbose:
+            print(f"Calling model.generate() for full audio. Options: {generate_options}")
+            print(f"Model device: {self.model.device}, Input features device: {input_features.device}, dtype: {input_features.dtype}")
 
-        # ---- Tokenizer & Prompt Setup ----
-        all_tokens: List[int] = []
-        all_segments: List[Dict[str, Any]] = []
-        prompt_reset_since = 0
-
-        if initial_prompt_str:
+        transcription_output = None
+        with torch.no_grad():
             try:
-                initial_prompt_tokens = self.processor.tokenizer.encode(" " + initial_prompt_str.strip())
-                all_tokens.extend(initial_prompt_tokens)
-            except Exception as e_prompt:
-                warnings.warn(f"Could not encode initial_prompt: {e_prompt}", UserWarning)
-
-
-        # ---- Main Transcription Loop (Windowing over raw audio samples) ----
-        num_samples_total = audio_waveform.shape[0]
-        seek_samples = 0 # Current position in audio_waveform samples
-
-        # Use CHUNK_LENGTH (30s) and N_SAMPLES_PER_CHUNK for windowing the audio waveform
-        with tqdm.tqdm(total=num_samples_total, unit="samples", disable=not self.verbose, desc="Transcribing Audio Chunks") as pbar:
-            while seek_samples < num_samples_total:
-                time_offset = float(seek_samples / SAMPLE_RATE)
+                # The `generate` method of `WhisperForConditionalGeneration` (which ipex_llm model is based on)
+                # has built-in long-form transcription capabilities and can return timestamps and segments.
+                # We need to ensure `return_timestamps=True` is passed for segments.
+                # And `return_dict_in_generate=True` to get a structured output.
                 
-                # Get the current audio chunk from the waveform
-                current_audio_chunk_waveform = audio_waveform[seek_samples : seek_samples + N_SAMPLES_PER_CHUNK]
+                generate_options.setdefault("return_dict_in_generate", True)
+                generate_options.setdefault("return_timestamps", True) # Request timestamps
+                # generate_options.setdefault("chunk_length_s", 30) # Might be needed for internal chunking if not default
+                # generate_options.setdefault("stride_length_s", 5) # For overlapping if model's generate supports it
 
-                # Process this chunk to get input_features
-                try:
-                    chunk_input_features = self.processor(
-                        current_audio_chunk_waveform.cpu().numpy(),
-                        sampling_rate=SAMPLE_RATE,
-                        return_tensors="pt"
-                    ).input_features # This should produce features for up to 30s, padded/trimmed to N_FRAMES_PER_CHUNK
-                except Exception as e_proc:
-                    warnings.warn(f"Error processing audio chunk at {time_offset:.2f}s: {e_proc}", RuntimeWarning)
-                    seek_samples += N_SAMPLES_PER_CHUNK # Skip this chunk
-                    pbar.update(N_SAMPLES_PER_CHUNK)
-                    continue
+                transcription_output = self.model.generate(
+                    input_features,
+                    **generate_options
+                )
 
-                # Ensure features are on the target device and correct dtype
-                model_dtype = next(self.model.parameters()).dtype
-                if chunk_input_features.device != self.target_device:
-                    chunk_input_features = chunk_input_features.to(self.target_device)
-                if chunk_input_features.dtype != model_dtype:
-                    chunk_input_features = chunk_input_features.to(model_dtype)
+                if self.target_device.type == "xpu":
+                    torch.xpu.synchronize()
+
+                # Process the output. `generate` with `return_dict_in_generate=True` returns a ModelOutput object
+                # or a list of dicts if `return_segments=True` was also handled.
+                # For Whisper, it typically returns a sequence of token IDs.
+                # We need to decode these and potentially extract segments if the output structure provides them.
                 
-                # The feature extractor should already pad/trim to N_FRAMES_PER_CHUNK.
-                # If not, self._pad_or_trim_features(chunk_input_features) would be needed here.
+                # If `transcription_output` is a tensor of IDs:
+                predicted_ids = transcription_output if isinstance(transcription_output, torch.Tensor) else transcription_output.sequences
 
-                # Prepare decoder_input_ids (prompt for the current segment)
-                prompt_tokens_for_current_segment: List[int] = []
-                try:
-                    # Get base prompt (SOT, lang, task)
-                    # Use the 'language' determined/passed for the whole transcription for consistency here
-                    decoder_prompt_list_of_lists = self.processor.get_decoder_prompt_ids(language=language, task=task, no_timestamps=True)
-                    if decoder_prompt_list_of_lists and decoder_prompt_list_of_lists[0] is not None:
-                        prompt_tokens_for_current_segment = list(decoder_prompt_list_of_lists[0])
-                    else:
-                        prompt_tokens_for_current_segment = [self.processor.tokenizer.sot_token_id] # Minimal
-                except Exception as e_dec_prompt:
-                    warnings.warn(f"Error getting decoder prompt ids for lang {language}, task {task}: {e_dec_prompt}. Using minimal SOT.", UserWarning)
-                    prompt_tokens_for_current_segment = [self.processor.tokenizer.sot_token_id]
-
-                if condition_on_previous_text:
-                    max_prompt_len = self.model.config.max_length // 2 - len(prompt_tokens_for_current_segment) -1 # Approximate
-                    max_prompt_len = max(0, max_prompt_len) # Ensure non-negative
-                    
-                    # Use tokens from `all_tokens` (which accumulates generated content tokens)
-                    previous_content_tokens = all_tokens[prompt_reset_since:]
-                    prompt_tokens_for_current_segment.extend(previous_content_tokens[-max_prompt_len:])
-
-                decoder_input_ids = torch.tensor([prompt_tokens_for_current_segment], device=self.target_device).long()
-
-                segment_generated_text = ""
-                segment_tokens_full_output = [] # To store full output tokens of this segment
+                full_text = self.processor.batch_decode(predicted_ids, skip_special_tokens=True)[0].strip()
                 
-                generated_successfully_this_segment = False
-                last_used_temperature = temperatures[0]
+                segments = []
+                # The HF `generate` for Whisper can return segments if `return_timestamps=True`
+                # The actual structure of `transcription_output` needs to be inspected.
+                # If `transcription_output` is a dict and contains 'segments':
+                if isinstance(transcription_output, dict) and "segments" in transcription_output:
+                    segments = transcription_output["segments"] # Assuming this format
+                elif hasattr(transcription_output, "segments"): # If it's an object with a segments attribute
+                    segments = transcription_output.segments
+                else: # Fallback if detailed segments are not directly available from this call
+                    if full_text:
+                        # For now, create a single segment for the whole text if no detailed ones
+                        # This needs to be improved to match the detailed segments from original whisper
+                        # by parsing timestamp tokens if predicted_ids include them.
+                        warnings.warn("Detailed segments with timestamps not yet fully extracted from model.generate() output. "
+                                      "Returning chunk-level or full text segment.", UserWarning)
+                        segments.append({"id": 0, "seek": 0, "start": 0.0, "end": audio_waveform.shape[0]/SAMPLE_RATE, "text": full_text, "tokens": predicted_ids.squeeze().tolist()})
 
-                for temp_idx, temp in enumerate(temperatures):
-                    current_generate_args = generate_args_base.copy()
-                    current_generate_args['temperature'] = temp
-                    
-                    # Adjust beam search / sampling based on temperature
-                    if temp == 0.0: # For temperature 0.0
-                        current_generate_args['do_sample'] = False
-                        current_generate_args['num_beams'] = 1 # FORCE GREEDY DECODING
-                        # Remove sampling-specific args that might conflict with greedy
-                        current_generate_args.pop('top_k', None)
-                        current_generate_args.pop('top_p', None)
-                        current_generate_args.pop('typical_p', None)
-                        current_generate_args.pop('epsilon_cutoff', None)
-                        current_generate_args.pop('eta_cutoff', None)
-                        # To potentially silence the UserWarning about temperature=0.0 and do_sample=False:
-                        # If num_beams is 1 and do_sample is False, temperature isn't strictly used by generate for sampling logic
-                        current_generate_args.pop('temperature', None) # Remove temperature for pure greedy
-                    elif temp > 0: # For sampling temperatures
-                        current_generate_args['do_sample'] = True
-                        # Ensure num_beams is not set, or set to 1, if we want pure temperature sampling
-                        current_generate_args.pop("num_beams", None) 
-                        # Ensure top_k/top_p are set if that's the desired sampling strategy with temperature
-                        current_generate_args.setdefault("top_k", 0) # Example: often 0 or 50 for top-k sampling
-                        current_generate_args.setdefault("top_p", 1.0) # Example: often 1.0 or 0.9 for top-p sampling
-                    # If temp == 0.0 and a user *explicitly* passed num_beams > 1 in kwargs, 
-                    # _get_transcribe_kwargs would have set it in generate_args_base.
-                    # The logic above now forces num_beams=1 for temp=0.0 for this test.
-                    # If you want to allow user-specified beam search for temp=0.0, this logic would differ.
-
-                    if self.verbose and len(temperatures) > 1:
-                        pbar.set_description_str(f"Transcribing (seek {seek_samples/SAMPLE_RATE:.1f}s, temp {temp:.1f})")
-
-                    try:
-                        predicted_ids_segment = self.model.generate(
-                            chunk_input_features,
-                            decoder_input_ids=decoder_input_ids,
-                            **current_generate_args
-                        )
-                        if self.target_device.type == "xpu": torch.xpu.synchronize()
-
-                        start_of_generation_idx = decoder_input_ids.shape[1]
-                        
-                        # Get only the newly generated tokens
-                        segment_tokens_generated_part = predicted_ids_segment[0, start_of_generation_idx:].tolist()
-                        
-                        segment_generated_text = self.processor.batch_decode(
-                            predicted_ids_segment[:, start_of_generation_idx:],
-                            skip_special_tokens=True
-                        )[0].strip()
-                        
-                        segment_tokens_full_output = predicted_ids_segment[0].tolist()
-
-                        # Simplified success criteria: if any text is generated.
-                        # TODO: Add more robust checks like logprob, compression, no_speech from original.
-                        if segment_generated_text: # Basic check
-                            generated_successfully_this_segment = True
-                            last_used_temperature = temp
-                            break 
-                        elif temp_idx == len(temperatures) - 1: # Last temperature, still no text
-                            if self.verbose: print(f"Segment at {time_offset:.2f}s produced no text after all temperatures.")
-                            generated_successfully_this_segment = True # Consider it "handled"
-                            last_used_temperature = temp
-                            break
-
-
-                    except Exception as e_gen:
-                        warnings.warn(f"Error during segment generation at {time_offset:.2f}s (temp {temp:.1f}): {e_gen}", RuntimeWarning)
-                        if temp_idx == len(temperatures) - 1: # Last temperature also failed
-                            segment_generated_text = f"[ERROR: Generation failed for segment at {time_offset:.2f}s]"
-                            segment_tokens_full_output = prompt_tokens_for_current_segment + [self.processor.tokenizer.eos_token_id]
-                            generated_successfully_this_segment = True # Mark as "handled"
-                            last_used_temperature = temp
-                
-                if not generated_successfully_this_segment: # Should be handled by last temp fallback
-                     segment_generated_text = f"[ERROR: All temperatures failed for segment at {time_offset:.2f}s]"
-                     segment_tokens_full_output = prompt_tokens_for_current_segment + [self.processor.tokenizer.eos_token_id]
-
-
-                # For simplicity, segment times are chunk boundaries.
-                # Original Whisper extracts precise timestamps from tokens if available.
-                # This requires decoding timestamp tokens, which is omitted here.
-                chunk_duration = current_audio_chunk_waveform.shape[0] / SAMPLE_RATE
-                segment_end_time = time_offset + chunk_duration
-                
-                all_segments.append({
-                    "id": len(all_segments),
-                    "seek": seek_samples, # seek in samples from start of audio
-                    "start": time_offset,
-                    "end": segment_end_time,
-                    "text": segment_generated_text,
-                    "tokens": segment_tokens_full_output, # Full output tokens for this segment
-                    "temperature": last_used_temperature,
-                    # Placeholders for metrics not easily available from HF generate
-                    "avg_logprob": -99.0, "compression_ratio": 0.0, "no_speech_prob": 0.0,
-                })
                 if self.verbose:
-                     print(f"[{time_offset:07.3f} --> {segment_end_time:07.3f}] {segment_generated_text}")
+                    print(f"--- Transcription ---")
+                    print(full_text)
+                    if segments and segments[0]['text'] != full_text : print(f"Segments: {segments[:2]}...") # Print first few if different
+                    print(f"--- End Transcription ---")
 
-                # Add only the newly generated part to all_tokens for conditioning next prompt
-                # This part needs to be careful about what `segment_tokens_generated_part` contains
-                # (e.g., does it include EOT or other control tokens that should be stripped before appending?)
-                # For robust conditioning, only actual content tokens should be added.
-                # The original `all_tokens.extend([token for segment in current_segments for token in segment["tokens"]])`
-                # used the full output tokens. Let's use our `segment_tokens_generated_part`.
-                
-                # We need to get content tokens from segment_tokens_generated_part
-                content_tokens_for_prompt = [
-                    tok for tok in segment_tokens_generated_part 
-                    if tok < self.processor.tokenizer.eos_token_id # Basic filter for content
-                ]
-                all_tokens.extend(content_tokens_for_prompt)
+                # Determine final language
+                # If language was None, model.generate might fill it in the output or config
+                # For now, use the language passed to generate_options or default
+                final_language = generate_options.get("language", "en") # Fallback
+                if hasattr(transcription_output, "language"):
+                    final_language = transcription_output.language
+                elif isinstance(transcription_output, dict) and "language" in transcription_output:
+                    final_language = transcription_output["language"]
 
-                if not condition_on_previous_text or last_used_temperature > 0.5:
-                    prompt_reset_since = len(all_tokens)
 
-                seek_samples += N_SAMPLES_PER_CHUNK
-                pbar.update(N_SAMPLES_PER_CHUNK if seek_samples <= num_samples_total else num_samples_total - (seek_samples - N_SAMPLES_PER_CHUNK) )
-        
-        final_text = self.processor.tokenizer.decode(all_tokens, skip_special_tokens=True).strip()
-        
-        # Language determination logic:
-        # If 'language' was initially None, the model might have predicted it in the first chunk.
-        # This simplified version uses the 'language' argument passed or defaulted.
-        # A more robust version would inspect the first segment's tokens for a language token.
-        final_determined_language = language if language is not None else "en" # Fallback
-        if language is None and all_segments and "tokens" in all_segments[0]:
-            first_segment_tokens = all_segments[0]["tokens"]
-            # Try to infer language from first segment tokens (this is complex)
-            # For example, look for language token after SOT if model is multilingual
-            # This is a placeholder for a proper language identification from tokens
-            pass 
+                return {
+                    "text": full_text,
+                    "segments": segments,
+                    "language": final_language
+                }
 
-        return {
-            "text": final_text,
-            "segments": all_segments,
-            "language": final_determined_language
-        }
+            except Exception as e:
+                warnings.warn(f"Error during model.generate() or full audio decoding: {e}", RuntimeWarning)
+                import traceback
+                traceback.print_exc()
+                return {"text": "", "segments": [], "language": generate_options.get("language", "en")}
 
 
     @staticmethod
     def _get_transcribe_kwargs(**kwargs: Any) -> Dict[str, Any]:
         """
-        Prepare keyword arguments for Hugging Face model's `generate` method,
-        with defaults aimed at improving long-form transcription stability.
+        Prepare keyword arguments for the model's sophisticated `generate` method,
+        which handles long-form transcription and timestamping internally.
         """
         generate_params = {}
-        # Parameters directly supported by Hugging Face generate or easily mapped
-        known_generate_options = [
-            "max_length", "max_new_tokens", "min_length", "min_new_tokens",
-            "early_stopping", "num_beams", "num_beam_groups", "do_sample", "use_cache",
-            "temperature", "top_k", "top_p", "typical_p", "epsilon_cutoff", "eta_cutoff",
-            "repetition_penalty", "length_penalty", "no_repeat_ngram_size",
-            "encoder_no_repeat_ngram_size", "bad_words_ids", "force_words_ids",
-            "forced_bos_token_id", "forced_eos_token_id", "remove_invalid_values",
-            "suppress_tokens", "begin_suppress_tokens",
-            "num_return_sequences", "output_attentions", "output_hidden_states",
-            "output_scores", "return_dict_in_generate",
-            "patience", # From original Whisper options, maps to HF generate patience
-        ]
         
+        # Parameters from the ipex_llm/transformers WhisperModel.generate signature
+        # and common generate/TranscriptionOptions parameters.
+        known_options = [
+            "language", "task", "temperature", "compression_ratio_threshold", 
+            "logprob_threshold", "no_speech_threshold", "condition_on_prev_tokens",
+            "initial_prompt", "return_timestamps", "return_token_timestamps",
+            "num_beams", "patience", "length_penalty", "repetition_penalty",
+            "no_repeat_ngram_size", "suppress_tokens", "max_new_tokens", "use_cache",
+            "do_sample", "top_k", "top_p",
+            # from original whisper/TranscriptionOptions that might map
+            "beam_size", "best_of", "prefix", "suppress_blank", 
+            "without_timestamps", "max_initial_timestamp", "word_timestamps", # word_timestamps often controls return_token_timestamps
+            "prepend_punctuations", "append_punctuations" 
+        ]
+
         for k, v in kwargs.items():
-            if k in known_generate_options:
+            if k in known_options:
                 generate_params[k] = v
             elif k == "sample_len" and "max_new_tokens" not in generate_params:
                 generate_params["max_new_tokens"] = v
-            # beam_size from kwargs (e.g. CLI) will be used for num_beams default below if not directly passed
+            # Map beam_size from CLI to num_beams for generate
+            elif k == "beam_size" and "num_beams" not in generate_params:
+                 generate_params["num_beams"] = v
         
-        # --- Defaults to help with stability for long audio, if not overridden by user via **kwargs ---
-        # Use a slight temperature to allow some variation and escape loops, unless user specifies one
-        generate_params.setdefault('temperature', 0.2) 
+        # --- Sensible Defaults for long-form if not provided ---
+        generate_params.setdefault('language', None) # Let generate handle detection if not specified by user
+        generate_params.setdefault('task', "transcribe")
+        generate_params.setdefault('return_timestamps', True) # ESSENTIAL for diarization later
+        generate_params.setdefault('condition_on_prev_tokens', True)
         
-        # Prevent short N-gram repetitions, unless user specifies one
-        generate_params.setdefault('no_repeat_ngram_size', 3) 
+        # Temperature: model.generate can often take a tuple for fallback
+        generate_params.setdefault('temperature', (0.0, 0.2, 0.4, 0.6, 0.8, 1.0))
         
-        # Default to beam search if temperature is low and not explicitly sampling,
-        # using 'beam_size' from kwargs if provided (e.g., from CLI), else default to 5.
-        # The 'temperature' here refers to the one potentially set by the user in kwargs,
-        # or our default of 0.2 if user didn't provide one.
-        # The windowed transcribe loop will override this per iteration. This sets a base strategy.
-        current_temp_for_logic = generate_params.get('temperature', 0.2) # Use setdefault value if no kwarg
-        
-        if not generate_params.get("do_sample", False): # If not explicitly asking for sampling
-            if current_temp_for_logic <= 0.2: # For low/greedy temperatures
-                # Default to beam search if num_beams is not already specified
-                generate_params.setdefault('num_beams', kwargs.get('beam_size', 5)) 
-            # If num_beams is now > 1 (either from kwargs or default), ensure do_sample is False
-            if generate_params.get('num_beams', 1) > 1:
-                generate_params['do_sample'] = False # Beam search and sampling are often mutually exclusive
-                # Clean up conflicting sampling parameters if beam search is active
-                generate_params.pop("top_k", None)
-                generate_params.pop("top_p", None)
-                generate_params.pop("typical_p", None)
-        else: # If do_sample is explicitly True
-            generate_params.pop("num_beams", None) # Ensure beam search is off for sampling
+        generate_params.setdefault('no_repeat_ngram_size', 3) # Good general default
 
-        # forced_decoder_ids is handled by passing decoder_input_ids in the main transcribe loop
-        generate_params.pop('forced_decoder_ids', None)
-        
-        # Max new tokens: Whisper segments are ~30s. Max tokens for that is ~N_FRAMES_PER_CHUNK / 2
-        # This should be a sensible default if not provided.
-        # self.model.config.max_length is for the *entire* sequence (prompt + generation).
-        # For generate, max_new_tokens or max_length (as total) is more relevant for a chunk.
-        generate_params.setdefault('max_new_tokens', N_FRAMES_PER_CHUNK // 2) # Approx max tokens for 30s chunk
+        # Beam search vs. Sampling (align with temperature)
+        user_num_beams = generate_params.get('num_beams')
+        current_temp = generate_params.get('temperature')
+        # If temperature is a tuple, take the first for this logic
+        first_temp = current_temp[0] if isinstance(current_temp, (list, tuple)) and current_temp else current_temp
+
+        if user_num_beams is not None and user_num_beams > 1: # User wants beam search
+            generate_params['do_sample'] = False
+            if first_temp is None or first_temp > 0.2: # Beam search usually uses low/zero temp
+                generate_params['temperature'] = 0.0 
+        elif generate_params.get('do_sample', False): # User wants sampling
+            generate_params['num_beams'] = 1 # Ensure no beam search
+            if first_temp is None: generate_params['temperature'] = 0.2 # Default sampling temp
+        else: # Default to greedy or beam if temperature is very low
+            if first_temp is None or first_temp <= 0.1: # Could be greedy or beam
+                 generate_params.setdefault('num_beams', 1) # Default to greedy for speed unless user specified >1
+                 if generate_params['num_beams'] == 1:
+                     generate_params.pop('temperature', None) # No temp for pure greedy
+                     generate_params['do_sample'] = False
+            else: # Higher initial temp implies sampling
+                 generate_params['do_sample'] = True
+                 generate_params['num_beams'] = 1
+
+
+        # Max new tokens per chunk (generate handles chunking internally)
+        # The model's generate has its own way of figuring out max_length per internal segment.
+        # max_new_tokens at this top level might control total tokens for the whole audio,
+        # or it might be a per-chunk setting if generate's API uses it that way.
+        # For now, let Whisper's generate manage this based on its internal chunking.
+        # We can remove our previous N_FRAMES_PER_CHUNK // 2 default for this if generate handles it.
+        generate_params.pop('max_new_tokens', None) # Let the model's generate handle this.
+                                                   # Or set a very large value if it's for the whole audio.
+                                                   # The HF pipeline example sets max_new_tokens=128 per chunk.
+                                                   # The `whisper_generate` has internal `num_segment_frames`.
+        if 'max_new_tokens' not in generate_params and kwargs.get('chunk_length_s'): # If user provides chunk_length_s
+            generate_params['max_new_tokens'] = 128 # A common default per chunk for pipeline
+
+        generate_params.setdefault('use_cache', True)
+
+        if generate_params.get('temperature') == 0.0 and \
+           not generate_params.get('do_sample', False) and \
+           generate_params.get('num_beams', 1) == 1:
+            generate_params.pop('temperature', None) # Silence transformers warning for pure greedy
 
         return generate_params
 
