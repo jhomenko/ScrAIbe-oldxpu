@@ -225,7 +225,7 @@ def cli():
                     audio_file_path, 
                     task=task_to_perform,
                     language=language_arg,
-                    verbose=verbose_arg
+                    verbose=verbose_arg,
                     num_beams=num_beams_arg
                 )
                 
