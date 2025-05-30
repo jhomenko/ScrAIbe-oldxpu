@@ -213,79 +213,109 @@ class OpenAIWhisperIPEXLLMTranscriber(Transcriber):
     @classmethod
     def load_model(cls,
                    model_name: str = "medium",
-                   download_root: Optional[str] = None, 
+                   download_root: Optional[str] = None,
                    device_option: Optional[Union[str, torch.device]] = None,
-                   use_ipex_llm: bool = True,
-                   low_bit: str = 'bf16',
+                   use_ipex_llm: bool = True, # This class is IPEX-LLM specific
+                   low_bit: str = 'bf16',    # Controls quantization: "bf16", "fp16", "int4", "sym_int4", etc.
                    use_auth_token: Optional[str] = None,
-                   in_memory: bool = False, # Kept for signature compatibility
+                   in_memory: bool = False, # Kept for signature compatibility if needed by other parts
+                   verbose: bool = False,   # Pass verbose flag for loader prints
                    **kwargs: Any 
                    ) -> 'OpenAIWhisperIPEXLLMTranscriber':
 
-        if not use_ipex_llm:
-            warnings.warn("OpenAIWhisperIPEXLLMTranscriber is intended for use_ipex_llm=True. "
-                          "Proceeding with IPEX-LLM loading.", UserWarning)
+        if not use_ipex_llm or ipex_llm is None: # Ensure ipex_llm is available
+            raise ImportError("IPEX-LLM library not found or use_ipex_llm is False. "
+                              "Cannot use OpenAIWhisperIPEXLLMTranscriber.")
 
-        if ipex_llm is None: # Ensure ipex_llm is imported and checked at module level
-            raise ImportError("IPEX-LLM library not found, cannot use OpenAIWhisperIPEXLLMTranscriber.")
-
-        target_device_str = str(device_option if device_option else SCRAIBE_TORCH_DEVICE) # Use your constants
+        target_device_str = str(device_option if device_option else SCRAIBE_TORCH_DEVICE)
         target_device = torch.device(target_device_str)
 
-        # --- Map short model names to full Hugging Face Hub identifiers ---
+        # Map short model names to full Hugging Face Hub identifiers
         hf_model_id = model_name
-        # Common Whisper model sizes from OpenAI
         official_short_names = ["tiny", "base", "small", "medium", "large", "large-v2", "large-v3"]
-        
-        # Check if model_name is a short name (e.g., "medium" or "tiny.en")
-        # and doesn't already look like a full path (e.g., "openai/whisper-medium")
-        potential_short_name = model_name.replace(".en", "") # Handle "tiny.en" -> "tiny" for the check
+        potential_short_name = model_name.replace(".en", "")
         if potential_short_name in official_short_names and "/" not in model_name:
             hf_model_id = f"openai/whisper-{model_name}"
-            print(f"Interpreted model_name '{model_name}' as Hugging Face ID '{hf_model_id}'")
-        # --- End mapping ---
+            if verbose: print(f"Interpreted model_name '{model_name}' as Hugging Face ID '{hf_model_id}'")
 
-        print(f"Loading Whisper model '{hf_model_id}' using ipex_llm.transformers "
-              f"with low_bit='{low_bit}' for device '{target_device_str}'")
+        if verbose:
+            print(f"Loading Whisper model '{hf_model_id}' using ipex_llm.transformers "
+                  f"with low_bit configuration: '{low_bit}' for device '{target_device_str}'")
 
-        # 1. Load WhisperProcessor
+        # Load WhisperProcessor
         try:
             processor = WhisperProcessor.from_pretrained(
-                hf_model_id, # Use mapped ID
-                cache_dir=download_root,
-                token=use_auth_token
+                hf_model_id, cache_dir=download_root, token=use_auth_token
             )
         except Exception as e:
             warnings.warn(f"Failed to load WhisperProcessor for '{hf_model_id}': {e}", RuntimeWarning)
             raise
 
-        # 2. Load model using ipex_llm.transformers.AutoModelForSpeechSeq2Seq
-        torch_dtype_map = {
-            'bf16': torch.bfloat16, 'fp16': torch.float16, 'fp32': torch.float32,
-        }
-        effective_torch_dtype = torch_dtype_map.get(low_bit.lower() if isinstance(low_bit, str) else "fp32", "auto")
-        if effective_torch_dtype == "auto" and low_bit not in ['bf16', 'fp16', 'fp32', None]:
-            effective_torch_dtype = None 
-
-        if target_device.type == 'cpu' and effective_torch_dtype == torch.float16:
-            warnings.warn("FP16 is not natively supported or optimal on CPU. "
-                          "IPEX-LLM might upcast or manage dtype with 'load_in_low_bit'.")
+        # Prepare arguments for AutoModelForSpeechSeq2Seq.from_pretrained
+        from_pretrained_main_args = {} # For load_in_4bit or load_in_low_bit
+        from_pretrained_other_kwargs = kwargs.copy() # For other passthrough args
+        from_pretrained_other_kwargs.setdefault('trust_remote_code', True)
+        from_pretrained_other_kwargs['cache_dir'] = download_root
+        from_pretrained_other_kwargs['token'] = use_auth_token
         
-        from_pretrained_kwargs = kwargs.copy()
-        from_pretrained_kwargs.setdefault('trust_remote_code', True)
+        # Add cpu_embedding=True for XPU device, based on IPEX-LLM docs
+        if target_device.type == 'xpu':
+            from_pretrained_other_kwargs.setdefault('cpu_embedding', True)
+            if verbose: print(f"INFO: Setting cpu_embedding=True for XPU device.")
+
+        normalized_low_bit = low_bit.lower() if isinstance(low_bit, str) else ""
+        effective_torch_dtype = "auto" # Default, let IPEX-LLM / Transformers decide
+
+        # Path for boolean 4-bit loading (like the INT4 example script)
+        if normalized_low_bit in ["int4", "4bit"]: # User explicitly asks for generic 4-bit
+            if verbose: print(f"INFO: Using INT4 settings: load_in_4bit=True, optimize_model=False (for low_bit='{low_bit}')")
+            from_pretrained_main_args['load_in_4bit'] = True
+            from_pretrained_main_args['optimize_model'] = False 
+            # For load_in_4bit, torch_dtype is typically not specified or "auto"
+            effective_torch_dtype = None # Let IPEX-LLM handle dtype for this pure 4-bit loading
+        
+        # Path for specific named low_bit formats (like bf16, fp16, or specific int strings like "sym_int4")
+        else:
+            if verbose: print(f"INFO: Using specific low_bit string: load_in_low_bit='{low_bit}', optimize_model=True")
+            from_pretrained_main_args['load_in_low_bit'] = low_bit # Pass the string e.g., "bf16", "sym_int4"
+            from_pretrained_main_args['optimize_model'] = True  # Generally True for specific low_bit optimizations
+
+            if normalized_low_bit == "bf16":
+                effective_torch_dtype = torch.bfloat16
+            elif normalized_low_bit == "fp16":
+                effective_torch_dtype = torch.float16
+                if target_device.type == 'cpu':
+                    warnings.warn("FP16 may not be optimal on CPU for all operations.", UserWarning)
+            elif normalized_low_bit in ["fp32", "none", ""]: # Explicit FP32 or no quantization
+                effective_torch_dtype = torch.float32
+                # If low_bit was specifically to turn off quantization, clear load_in_low_bit
+                if 'load_in_low_bit' in from_pretrained_main_args and (normalized_low_bit in ["fp32", "none", ""]):
+                    from_pretrained_main_args.pop('load_in_low_bit')
+            else: # For other specific quantization strings (e.g., "sym_int4", "nf4")
+                  # let IPEX-LLM infer/handle the torch_dtype.
+                effective_torch_dtype = None 
+
+        # Set torch_dtype if it's determined and not 'auto' or None
+        if effective_torch_dtype is not None and effective_torch_dtype != "auto":
+            from_pretrained_main_args['torch_dtype'] = effective_torch_dtype
+        # If effective_torch_dtype ended up as None (e.g. for int4 or specific quant strings),
+        # ensure torch_dtype is not in main_args to let from_pretrained default.
+        elif 'torch_dtype' in from_pretrained_main_args and effective_torch_dtype is None:
+            from_pretrained_main_args.pop('torch_dtype')
+
+        # Combine all arguments for from_pretrained
+        final_from_pretrained_args = {**from_pretrained_main_args, **from_pretrained_other_kwargs}
+
+        if verbose:
+            print(f"DEBUG: Final from_pretrained arguments for model loading: {final_from_pretrained_args}")
 
         try:
             model_instance = AutoModelForSpeechSeq2Seq.from_pretrained(
-                hf_model_id, # Use mapped ID
-                load_in_low_bit=low_bit,
-                optimize_model=True,
-                torch_dtype=effective_torch_dtype if effective_torch_dtype else "auto",
-                cache_dir=download_root,
-                token=use_auth_token,
-                **from_pretrained_kwargs
+                hf_model_id,
+                **final_from_pretrained_args
             )
         except Exception as e:
-            warnings.warn(f"Failed to load model '{hf_model_id}' using IPEX-LLM AutoModelForSpeechSeq2Seq: {e}", RuntimeWarning)
+            warnings.warn(f"Failed to load model '{hf_model_id}' using IPEX-LLM with args {final_from_pretrained_args}: {e}", RuntimeWarning)
             raise
 
         model_instance = model_instance.eval()
@@ -294,7 +324,7 @@ class OpenAIWhisperIPEXLLMTranscriber(Transcriber):
             model_instance = model_instance.to(target_device)
             loaded_model_dtype = next(model_instance.parameters()).dtype
             print(f"IPEX-LLM Whisper model '{hf_model_id}' loaded. Target device: '{target_device}'. "
-                  f"Effective model dtype: {loaded_model_dtype}. Low-bit optimization: '{low_bit}'.")
+                  f"Effective model dtype: {loaded_model_dtype}. Low-bit config: '{low_bit}'.")
         except Exception as e:
             warnings.warn(f"Failed to move IPEX-LLM loaded model to '{target_device}': {e}. "
                           f"Model remains on its current device: {model_instance.device}", RuntimeWarning)
