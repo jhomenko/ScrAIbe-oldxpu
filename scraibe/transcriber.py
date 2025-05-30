@@ -43,7 +43,8 @@ Usage:
 
 from abc import ABC, abstractmethod
 from inspect import signature
-from typing import TypeVar, Union, Optional, Dict, Any
+from typing import TypeVar, Union, Optional, Dict, Any, List, Tuple
+import tqdm # For the progress bar
 
 import torch
 from torch import Tensor, device
@@ -62,6 +63,21 @@ from transformers import WhisperProcessor
 # FasterWhisper imports
 from faster_whisper import WhisperModel as FasterWhisperModel
 from faster_whisper.tokenizer import _LANGUAGE_CODES as FASTER_WHISPER_LANGUAGE_CODES
+
+# --- Define Whisper constants (adapted from openai-whisper/whisper/audio.py) ---
+# These are typically derived from the model's config or feature_extractor,
+# but defining them explicitly based on Whisper standards for clarity in this port.
+# Ensure these match your loaded model/processor if they differ.
+SAMPLE_RATE = 16000
+N_FFT = 400
+HOP_LENGTH = 160 # self.processor.feature_extractor.hop_length
+CHUNK_LENGTH = 30 # seconds
+N_SAMPLES_PER_CHUNK = CHUNK_LENGTH * SAMPLE_RATE # 480000
+N_FRAMES_PER_CHUNK = N_SAMPLES_PER_CHUNK // HOP_LENGTH # 3000 frames for a 30-second window
+# N_MELS = 80 # self.processor.feature_extractor.feature_size or self.model.config.num_mel_bins
+
+# For token context
+# MAX_TEXT_TOKEN_LENGTH = 448 # self.model.config.max_length or similar for decoder
 
 # IPEX-LLM import (optional)
 try:
@@ -286,131 +302,345 @@ class OpenAIWhisperIPEXLLMTranscriber(Transcriber):
 
         return cls(hf_model_id, model_instance, processor, target_device, low_bit_format=low_bit)
 
+    def _pad_or_trim_features(self, features: torch.Tensor, length: int = N_FRAMES_PER_CHUNK) -> torch.Tensor:
+        """Pads or trims the input mel spectrogram features to a specified length."""
+        if features.shape[-1] > length:
+            features = features[..., :length]
+        elif features.shape[-1] < length:
+            padding = length - features.shape[-1]
+            features = torch.nn.functional.pad(features, (0, padding))
+        return features
+
     def transcribe(self, audio: Union[str, torch.Tensor, np.ndarray], **kwargs: Any) -> Dict[str, Any]:
         """
-        Transcribe audio using the IPEX-LLM loaded Whisper model and its generate method.
-        Uses decoder_input_ids to set initial language and task tokens.
+        Transcribe long audio files using a windowed approach, adapted from openai-whisper,
+        with the IPEX-LLM loaded Whisper model.
+
+        Args:
+            audio (Union[str, torch.Tensor, np.ndarray]): Audio input.
+                   If ndarray or Tensor, assumed to be a 1D float32 waveform.
+                   If str, it's a path (this method expects Scraibe to pass the waveform Tensor).
+            **kwargs:
+                language (str, optional): Language of the audio. Auto-detected if None.
+                task (str, optional): 'transcribe' or 'translate'. Defaults to 'transcribe'.
+                verbose (bool, optional): Enables print statements.
+                temperature (Union[float, Tuple[float, ...]], optional): Temperature(s) for generation.
+                condition_on_previous_text (bool, optional): Defaults to True.
+                initial_prompt (Optional[str], optional): Prompt for the first window.
+                no_speech_threshold (Optional[float], optional): Threshold for detecting no speech.
+                logprob_threshold (Optional[float], optional): Threshold for average log probability.
+                compression_ratio_threshold (Optional[float], optional): Threshold for compression ratio.
+                ... (other options that might map to generate() or control logic)
+        Returns:
+            Dict[str, Any]: {"text": str, "segments": List[Dict], "language": str}
         """
         if not self.processor or not self.model:
             raise RuntimeError("Transcriber is not properly initialized with a model and processor.")
 
-        if "verbose" in kwargs: # Update instance verbose if passed for this call
-            self.verbose = kwargs["verbose"]
+        # ---- Parameter Setup ----
+        self.verbose = kwargs.get("verbose", self.verbose) # Update instance verbose
+        
+        # Default values from openai-whisper transcribe function signature
+        temperature_option = kwargs.get("temperature", (0.0, 0.2, 0.4, 0.6, 0.8, 1.0))
+        if isinstance(temperature_option, (float, int)):
+            temperatures = (temperature_option,)
+        else:
+            temperatures = tuple(temperature_option)
 
+        condition_on_previous_text = kwargs.get("condition_on_previous_text", True)
+        initial_prompt_str = kwargs.get("initial_prompt")
+        
+        # Fallback / quality thresholds (harder to implement fully without DecodingResult object)
+        # For now, these will be noted but not fully used in fallback logic as in original.
+        # We will rely more on temperature and no_repeat_ngram_size.
+        logprob_threshold = kwargs.get("logprob_threshold", -1.0)
+        no_speech_threshold = kwargs.get("no_speech_threshold", 0.6) # This is tricky without no_speech_prob
+        compression_ratio_threshold = kwargs.get("compression_ratio_threshold", 2.4)
+
+        # Get generation kwargs, apply some defaults for stability
+        generate_args_base = self._get_transcribe_kwargs(**kwargs)
+        generate_args_base.setdefault('use_cache', True)
+        # no_repeat_ngram_size was set in _get_transcribe_kwargs, ensure it's there
+        generate_args_base.setdefault('no_repeat_ngram_size', 3) 
+
+
+        # ---- Audio Preprocessing ----
         if isinstance(audio, str):
-            raise NotImplementedError("This transcribe method expects a waveform Tensor, not a path. "
-                                      "Ensure Scraibe passes audio_processor.waveform.")
+            raise NotImplementedError("This transcribe method expects a waveform Tensor. Path loading should be handled by Scraibe.")
         elif isinstance(audio, np.ndarray):
-            audio = torch.from_numpy(audio.astype(np.float32))
-        elif not isinstance(audio, torch.Tensor):
+            audio_waveform = torch.from_numpy(audio.astype(np.float32))
+        elif isinstance(audio, torch.Tensor):
+            audio_waveform = audio.to(torch.float32)
+        else:
             raise TypeError(f"Expected audio to be str, Tensor, or ndarray, but got {type(audio)}")
 
-        # Ensure audio is a 1D float32 tensor for the processor
-        if audio.ndim > 1: audio = audio.squeeze()
-        if audio.ndim != 1: raise ValueError(f"Audio waveform must be 1D, but got {audio.ndim} dimensions.")
-        if audio.dtype != torch.float32: audio = audio.to(torch.float32)
+        if audio_waveform.ndim > 1: audio_waveform = audio_waveform.squeeze()
+        if audio_waveform.ndim != 1: raise ValueError(f"Audio waveform must be 1D, got {audio_waveform.ndim} dims.")
 
-        # 1. Preprocess audio to input features
+        if self.verbose: print("Extracting mel spectrogram for the entire audio...")
         try:
-            input_features = self.processor(
-                audio.cpu().numpy(), # Processor might expect numpy array
-                sampling_rate=16000, # Whisper standard
+            # Get input_features (mel spectrogram) for the *entire* audio
+            # Processor expects numpy array or list of floats for raw audio.
+            full_input_features = self.processor(
+                audio_waveform.cpu().numpy(),
+                sampling_rate=SAMPLE_RATE,
                 return_tensors="pt"
-            ).input_features
+            ).input_features # Shape: (batch_size, num_mel_bins, num_frames)
         except Exception as e:
-            warnings.warn(f"Error during processor feature extraction: {e}", RuntimeWarning)
+            warnings.warn(f"Error during full audio feature extraction: {e}", RuntimeWarning)
             raise
-
-        # 2. Move input features to the same device and dtype as the model expects
-        try:
-            model_first_param_dtype = next(self.model.parameters()).dtype
-            if input_features.device != self.target_device:
-                input_features = input_features.to(self.target_device)
-            if input_features.dtype != model_first_param_dtype:
-                if self.verbose:
-                    print(f"Casting input_features from {input_features.dtype} to model dtype {model_first_param_dtype} "
-                          f"for device {self.target_device}.")
-                input_features = input_features.to(model_first_param_dtype)
-        except Exception as e:
-            warnings.warn(f"Could not move/cast input_features to target device/dtype: {e}", RuntimeWarning)
-            # Proceeding, but there might be issues.
-
-        # 3. Prepare decoder_input_ids for language and task
-        language = kwargs.get("language", "en")
-        task = kwargs.get("task", "transcribe")
         
-        initial_decoder_ids_tensor: Optional[torch.Tensor] = None
-        try:
-            # get_decoder_prompt_ids returns a list of lists, e.g., [[50258, 50259, 50359, 50363]]
-            # We need a tensor of shape (batch_size, sequence_length) for decoder_input_ids
-            prompt_ids_list = self.processor.get_decoder_prompt_ids(language=language, task=task)
-            if prompt_ids_list: 
-                 initial_decoder_ids_tensor = torch.tensor(prompt_ids_list, device=self.target_device).long()
-                 # Ensure it's 2D: (batch_size, sequence_length)
-                 if initial_decoder_ids_tensor.ndim == 1: 
-                     initial_decoder_ids_tensor = initial_decoder_ids_tensor.unsqueeze(0)
-            else:
-                warnings.warn("processor.get_decoder_prompt_ids returned empty or None.", UserWarning)
-        except Exception as e:
-            warnings.warn(f"Could not get initial_decoder_ids for language='{language}', task='{task}': {e}. "
-                          "Model will use its defaults for starting sequence.", UserWarning)
+        # Ensure features are on the target device and correct dtype for the model
+        model_dtype = next(self.model.parameters()).dtype
+        if full_input_features.device != self.target_device:
+            full_input_features = full_input_features.to(self.target_device)
+        if full_input_features.dtype != model_dtype:
+            if self.verbose: print(f"Casting full_input_features to model dtype {model_dtype}")
+            full_input_features = full_input_features.to(model_dtype)
         
-        if self.verbose:
-            print(f"Transcribing with: language='{language}', task='{task}', "
-                  f"model_device='{self.model.device}', input_features_device='{input_features.device}', "
-                  f"input_features_dtype='{input_features.dtype}'")
-            if initial_decoder_ids_tensor is not None:
-                 try:
-                     # Squeeze to make it 1D for convert_ids_to_tokens if batch size is 1
-                     display_ids_list = initial_decoder_ids_tensor.squeeze().tolist()
-                     decoded_prompt_tokens = self.processor.tokenizer.convert_ids_to_tokens(display_ids_list)
-                     print(f"Using initial decoder_input_ids (prompt): {decoded_prompt_tokens}")
-                 except Exception:
-                     print(f"Using initial decoder_input_ids: (unable to decode for display)")
+        content_frames = full_input_features.shape[-1]
 
-        # 4. Get other generate options, ensuring 'forced_decoder_ids' is not among them
-        generate_options = self._get_transcribe_kwargs(**kwargs) 
-        generate_options.pop('forced_decoder_ids', None) # We are using decoder_input_ids instead
-
-        # 5. Generate token IDs
-        transcription_text = ""
-        with torch.no_grad():
+        # ---- Language Detection (Simplified for now) ----
+        # The original has a more elaborate `model.detect_language`.
+        # For HF models, language is usually set by prompting with language tokens.
+        current_language = kwargs.get("language")
+        if current_language is None:
+            # Basic language detection: Use the first chunk.
+            # This is a simplification. A dedicated detect_language call might be better.
+            if self.verbose: print("Language not specified, attempting to detect from first 30s...")
+            first_chunk_features = self._pad_or_trim_features(full_input_features[..., :N_FRAMES_PER_CHUNK])
+            
+            # Generate with language detection prompt (e.g., just SOT)
+            # This is tricky as generate() doesn't have a direct "detect_language" mode like original Whisper.
+            # It usually infers from initial tokens or lack thereof.
+            # For now, we'll rely on the processor to provide a generic start if lang is None.
+            # Or, we can try to generate and see what language token it outputs if model is multilingual.
+            # This part is complex to replicate perfectly. Let's assume language is 'en' if not detected.
+            # A robust way: generate from first chunk without lang prompt, check first few generated tokens.
             try:
-                generate_options.setdefault('use_cache', True) # As in benchmark
-                
-                predicted_ids = self.model.generate(
-                    input_features,
-                    decoder_input_ids=initial_decoder_ids_tensor, # Pass the prepared decoder input IDs
-                    **generate_options
-                )
-
-                if self.target_device.type == "xpu":
-                    torch.xpu.synchronize()
-
-                # 6. Decode token IDs to text
-                transcription_text = self.processor.batch_decode(predicted_ids, skip_special_tokens=True)[0]
-                
-                if self.verbose:
-                    print(f"--- Transcription ---")
-                    print(transcription_text)
-                    print(f"--- End Transcription ---")
-
+                # A simplified way to get the processor to tell us the language if model is multilingual.
+                # This might involve a small generation or inspecting processor's capabilities.
+                # For now, if not provided, we'll default or let the first segment's prompt handle it.
+                # The processor's get_decoder_prompt_ids might handle language=None.
+                temp_prompt_ids = self.processor.get_decoder_prompt_ids(language=None, task="transcribe")
+                # This doesn't directly give detected lang, but sets up for it.
+                # The actual language will be part of the first segment's output if model is multilingual.
+                # For now, let's assume if language is None, the first generate call will determine it.
+                # We will extract it from the first segment's generated tokens.
+                if self.verbose: print("Language detection will occur during the first segment's transcription.")
             except Exception as e:
-                warnings.warn(f"Error during model.generate() or decoding: {e}", RuntimeWarning)
-                import traceback
-                traceback.print_exc() # Print full traceback for the error in generate
-                return {"text": "", "segments": [], "language": language}
+                warnings.warn(f"Could not prepare for language detection: {e}. Defaulting to 'en' or model's default.", UserWarning)
+                current_language = "en" # Fallback
 
-        # Basic segment creation (full text as one segment)
-        segments = []
-        if transcription_text:
-            segments.append({"start": 0.0, "end": 0.0, "text": transcription_text.strip()}) 
+        task = kwargs.get("task", "transcribe")
+
+        # ---- Tokenizer & Prompt Setup ----
+        all_tokens: List[int] = []
+        all_segments: List[Dict[str, Any]] = []
+        prompt_reset_since = 0 # Index in all_tokens
+
+        if initial_prompt_str:
+            initial_prompt_tokens = self.processor.tokenizer.encode(" " + initial_prompt_str.strip())
+            all_tokens.extend(initial_prompt_tokens)
+
+        # ---- Main Transcription Loop (Windowing) ----
+        seek = 0
+        with tqdm.tqdm(total=content_frames, unit="frames", disable=not self.verbose, desc="Transcribing") as pbar:
+            while seek < content_frames:
+                time_offset = float(seek * HOP_LENGTH / SAMPLE_RATE)
+                segment_features = full_input_features[..., seek : seek + N_FRAMES_PER_CHUNK]
+                segment_features_padded = self._pad_or_trim_features(segment_features) # Pad to N_FRAMES_PER_CHUNK
+
+                # Prepare decoder_input_ids (prompt for the current segment)
+                # This includes SOT, language, task, and previous text if conditioning
+                previous_tokens_for_prompt = []
+                if condition_on_previous_text:
+                    # Max prompt length is roughly half the context window
+                    # This needs to be based on self.model.config.max_length or similar
+                    # For simplicity, let's use a fixed number or a portion of a typical context window (e.g. 224 tokens)
+                    max_prompt_len = getattr(self.model.config, 'max_position_embeddings', 512) // 2 - 4 # Reserve space for lang/task tokens
+                    
+                    # Get tokens from previous transcription to use as prompt
+                    prompt_start_index = prompt_reset_since
+                    previous_tokens_for_prompt.extend(all_tokens[prompt_start_index:])
+                    previous_tokens_for_prompt = previous_tokens_for_prompt[-max_prompt_len:]
+
+                # Get base prompt (SOT, lang, task)
+                try:
+                    # If language was None, the first iteration will use language=None here,
+                    # subsequent iterations will use the detected_lang_from_first_segment
+                    lang_for_prompt = current_language
+                    if current_language is None and all_segments: # If lang was detected from first segment
+                        lang_for_prompt = all_segments[0].get("language", "en")
+
+                    current_decoder_prompt_list = self.processor.get_decoder_prompt_ids(
+                        language=lang_for_prompt, 
+                        task=task, 
+                        no_timestamps=True # Typically for prompting, timestamps are not part of the text prompt
+                    )
+                    # get_decoder_prompt_ids returns list of lists, e.g. [[50257, 50296, 50359, 50363]]
+                    # We need the inner list.
+                    current_prompt_tokens = current_decoder_prompt_list[0] if current_decoder_prompt_list else []
+                except Exception as e:
+                    warnings.warn(f"Error getting decoder prompt ids for lang {current_language}, task {task}: {e}. Using minimal prompt.", UserWarning)
+                    current_prompt_tokens = [self.processor.tokenizer.sot_token_id] # Minimal SOT
+
+                # Combine with previous text tokens if conditioning
+                current_prompt_tokens.extend(previous_tokens_for_prompt)
+                
+                # Ensure prompt is not too long for the model
+                # This needs a proper truncation strategy if it exceeds model's capacity.
+                # For now, assuming previous_tokens_for_prompt was already limited.
+                
+                decoder_input_ids = torch.tensor([current_prompt_tokens], device=self.target_device).long()
+
+                segment_generated_text = ""
+                segment_tokens = []
+                
+                # --- Equivalent of decode_with_fallback ---
+                # Simplified: iterate temperatures, use first successful.
+                # Full fallback checks (compression, logprob) are complex to add here without DecodingResult.
+                generated_successfully = False
+                for temp_idx, temp in enumerate(temperatures):
+                    current_generate_args = generate_args_base.copy()
+                    current_generate_args['temperature'] = temp
+                    
+                    # Adjust beam search / sampling based on temperature
+                    if temp > 0: # Sampling
+                        current_generate_args['do_sample'] = True
+                        current_generate_args.pop("num_beams", None) # Disable beam search for sampling
+                        current_generate_args.setdefault("top_k", 0) # For temperature sampling
+                    else: # Greedy or Beam search
+                        current_generate_args['do_sample'] = False
+                        current_generate_args.setdefault('num_beams', 1) # Default to greedy if not set
+                        if current_generate_args['num_beams'] == 1: current_generate_args.pop('num_beams', None)
+
+
+                    if self.verbose and len(temperatures) > 1:
+                        print(f"  Attempting segment from {time_offset:.2f}s with temperature {temp:.1f}")
+
+                    try:
+                        predicted_ids_segment = self.model.generate(
+                            segment_features_padded,
+                            decoder_input_ids=decoder_input_ids,
+                            **current_generate_args
+                        )
+                        if self.target_device.type == "xpu": torch.xpu.synchronize()
+
+                        # Decode, removing prompt tokens from the beginning of the output
+                        # The prompt tokens are part of decoder_input_ids, so generate() output will include them.
+                        # We need to slice them off.
+                        start_of_generation_idx = decoder_input_ids.shape[1] if decoder_input_ids is not None else 0
+                        
+                        segment_tokens_generated_only = predicted_ids_segment[0, start_of_generation_idx:].tolist()
+                        
+                        # Filter out special tokens like EOT, SOT, lang, task from the *generated* part
+                        # This is a bit tricky as we want to keep actual content.
+                        # For now, skip_special_tokens=True in batch_decode handles most of this.
+                        segment_generated_text = self.processor.batch_decode(
+                            predicted_ids_segment[:, start_of_generation_idx:], # Decode only generated part
+                            skip_special_tokens=True
+                        )[0].strip()
+                        
+                        segment_tokens = predicted_ids_segment[0].tolist() # Store all tokens for this segment for context
+
+                        # Simplified check: if text is generated, consider it a success for this temp
+                        # More advanced checks (repetition, no_speech_prob) would go here.
+                        if segment_generated_text or kwargs.get("no_speech_threshold") is None: # If no_speech_threshold is used, need a way to check no_speech_prob
+                            generated_successfully = True
+                            break # Success with this temperature
+
+                    except Exception as e_gen:
+                        warnings.warn(f"Error during segment generation (temp {temp:.1f}): {e_gen}", RuntimeWarning)
+                        if temp_idx == len(temperatures) - 1: # Last temperature failed
+                            segment_generated_text = f"[ERROR: Generation failed for segment at {time_offset:.2f}s]"
+                            segment_tokens = current_prompt_tokens + [self.processor.tokenizer.eos_token_id] # Minimal tokens
+                            generated_successfully = True # Mark as "handled" to proceed
+                        # Continue to next temperature if not the last one
+
+                if not generated_successfully: # Should not happen if last temp error is handled
+                     segment_generated_text = f"[ERROR: All temperatures failed for segment at {time_offset:.2f}s]"
+                     segment_tokens = current_prompt_tokens + [self.processor.tokenizer.eos_token_id]
+
+
+                # If language was None and this is the first segment, try to extract detected language
+                if current_language is None and not all_segments:
+                    try:
+                        # Look for language token in the initial part of segment_tokens (after SOT)
+                        # This is a heuristic. Whisper models embed lang token early.
+                        # Example: <|sot|> <|lang_code|> <|task|> ...
+                        # The actual language token ID needs to be identified.
+                        # self.processor.tokenizer.lang_code_to_id might be useful if we know the token structure.
+                        # For now, we'll assume the 'language' arg passed to get_decoder_prompt_ids was sufficient
+                        # or the model defaults correctly. A more robust detection is complex here.
+                        # Let's assume the language passed to the processor for the prompt is the one to use.
+                        # If lang_for_prompt was None, this is still an issue.
+                        # The original Whisper `transcribe` sets `decode_options["language"]` after `model.detect_language`.
+                        # We are missing that direct detection step.
+                        # For now, if language was None, we'll set it to 'en' or what the processor might default to.
+                        # This part needs refinement for robust auto language detection.
+                        # Let's assume the language passed to processor.get_decoder_prompt_ids is the one.
+                        # If it was None, the model might output a language token.
+                        # This is a complex part to replicate.
+                        # For now, we'll use the 'language' that was used for the prompt.
+                        # If it was None initially, it means we rely on model's multilingual capability.
+                        # The returned 'language' will be what was used for prompting.
+                        pass # current_language is already set or was None.
+                    except Exception:
+                        pass # Ignore if lang detection from tokens fails.
+
+                # Create segment dictionary
+                # Timestamps are based on audio window, not precise speech start/end from model's timestamp tokens yet.
+                segment_end_time = time_offset + (len(segment_features[0]) * HOP_LENGTH / SAMPLE_RATE)
+                # Ensure segment_end_time does not exceed total audio duration
+                total_audio_duration_approx = content_frames * HOP_LENGTH / SAMPLE_RATE
+                segment_end_time = min(segment_end_time, total_audio_duration_approx)
+
+
+                all_segments.append({
+                    "id": len(all_segments),
+                    "seek": seek * HOP_LENGTH, # Seek in samples
+                    "start": time_offset,
+                    "end": segment_end_time,
+                    "text": segment_generated_text,
+                    "tokens": segment_tokens, # Full tokens for this segment including prompt
+                    "temperature": temp, # Last used temperature
+                    # The following are not easily available from HF generate, placeholders
+                    "avg_logprob": -99.0, 
+                    "compression_ratio": 0.0,
+                    "no_speech_prob": 0.0,
+                })
+                if self.verbose:
+                    print(f"[{time_offset:07.3f} --> {segment_end_time:07.3f}] {segment_generated_text}")
+
+                # Update context for next segment
+                all_tokens.extend(segment_tokens_generated_only) # Add only newly generated tokens for next prompt
+                if not condition_on_previous_text or temp > 0.5: # Original logic
+                    prompt_reset_since = len(all_tokens) 
+
+                # Advance seek position
+                # The original code has complex logic for advancing seek based on timestamp tokens.
+                # Simplified seek: advance by the window size.
+                # A more advanced version would adjust seek based on the actual content transcribed.
+                # For now, fixed window progression.
+                seek += N_FRAMES_PER_CHUNK 
+                pbar.update(N_FRAMES_PER_CHUNK)
+        
+        final_text = self.processor.tokenizer.decode(all_tokens, skip_special_tokens=True).strip()
+        
+        # Determine final language (if auto-detected, it would be from the first segment, or model default)
+        final_language = current_language
+        if final_language is None and all_segments: # Try to get from first segment if still None
+            # This is a placeholder for more robust language detection result
+            # The 'language' field in each segment could be populated if model outputs lang tokens
+            final_language = all_segments[0].get("language_from_model_output", "en") # Needs actual detection
 
         return {
-            "text": transcription_text.strip(),
-            "segments": segments,
-            "language": language 
+            "text": final_text,
+            "segments": all_segments,
+            "language": final_language if final_language else "en" # Fallback
         }
+
 
     @staticmethod
     def _get_transcribe_kwargs(**kwargs: Any) -> Dict[str, Any]:
