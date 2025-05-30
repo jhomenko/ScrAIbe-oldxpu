@@ -30,7 +30,7 @@ exclude =[
 ]
 
 [tool.poetry.dependencies]
-python = "^3.9" # Or ^3.11 if you prefer
+python = "^3.9" # Or ^3.11 as per ipex-llm quickstart
 
 # Core application dependencies
 tqdm = "^4.66.5"
@@ -39,37 +39,28 @@ openai-whisper = ">=20231117,<20240931"
 faster-whisper = "^1.0.3"
 "pyannote.audio" = ">=3.1.0"
 
-# --- PyTorch 2.7 Stack for XPU (as per Intel documentation) ---
-torch = { version = "==2.7.0", source = "pytorch-xpu" }
-torchvision = { version = "==0.22.0", source = "pytorch-xpu" } # Align with PT 2.7.0 if used
-torchaudio = { version = "==2.7.0", source = "pytorch-xpu" }
-intel-extension-for-pytorch = { version = "==2.7.10+xpu", source = "intel" }
-oneccl_bind_pt = { version = "==2.7.0+xpu", source = "intel" }
+# --- PyTorch Stack for IPEX-LLM [xpu_2.6] ---
+# Target IPEX 2.6.10+xpu and a compatible PyTorch 2.6.x XPU version.
+# The exact PyTorch XPU version string (e.g., "==2.6.0")
+# needs to be available from the "pytorch-xpu" source.
+# Using explicit source assignment for these critical XPU packages.
+torch = { version = ">=2.6.0,<2.7.0", source = "pytorch-xpu" }
+torchaudio = { version = ">=2.6.0,<2.7.0", source = "pytorch-xpu" }
+intel-extension-for-pytorch = { version = "==2.6.10+xpu", source = "intel" }
+# oneccl_bind_pt = { version = ">=2.6.0,<2.7.0", source = "intel" } # Add if needed
 
 # --- IPEX-LLM ---
-# Now, we need an ipex-llm version compatible with PyTorch 2.7 / IPEX 2.7.
-# This might require a specific [xpu_2.7] tag or a recent ipex-llm version.
-# If a direct [xpu_2.7] isn't found, you might need to check ipex-llm release notes
-# or try a recent version and see if its dependencies are compatible or if it pulls compatible ones.
-# For now, let's specify a recent version and the generic [xpu] extra. Poetry will try to make it fit.
-# If this causes PyTorch/IPEX downgrades, then ipex-llm doesn't yet have a stable release for PT 2.7.
-ipex-llm = { version = ">=2.3.0rc1", extras = ["xpu"], optional = true } # Making it optional for now
+ipex-llm = { version = ">=2.3.0rc1", extras = ["xpu_2.6"] }
 
-# Pinning transformers, tokenizers, accelerate if ipex-llm requires specific older versions.
-# These were observed with an ipex-llm 2.3.0rc1 install attempt.
-# If ipex-llm works with newer ones, these can be relaxed.
-transformers = { version = "==4.37.0", optional = true }
-tokenizers = { version = "==0.15.2", optional = true }
-accelerate = { version = "==0.23.0", optional = true }
-
-[tool.poetry.extras]
-ipex_llm_feature = ["ipex-llm", "transformers", "tokenizers", "accelerate"] # Group ipex-llm related deps
+# --- Dependencies potentially pinned by ipex-llm ---
+transformers = "==4.37.0"
+tokenizers = "==0.15.2"
+accelerate = "==0.23.0"
 
 [tool.poetry.group.dev.dependencies]
 pytest = "^8.1.1"
 
 [tool.poetry-dynamic-versioning]
-# ... (your existing dynamic versioning config) ...
 enable = true
 vcs = "git"
 strict = true
@@ -84,32 +75,29 @@ format-jinja = """
 """
 
 [tool.poetry.group.docs.dependencies]
-# ... (your existing docs dependencies) ...
 sphinx = "^7.3.7"
 sphinx-rtd-theme = ">=2,<4"
 markdown-it-py = {version = "~3.0.0", extras = ["plugins"]}
 myst-parser = "^3.0.1"
 mdit-py-plugins = "^0.4.1"
 
-
 [tool.poetry.scripts]
 scraibe = "scraibe.cli:cli"
 
+# Source definitions for Poetry
 [[source]]
 name = "pytorch-xpu"
 url = "https://download.pytorch.org/whl/xpu"
-# priority = "explicit" # Using explicit source assignment per dependency instead
 
 [[source]]
 name = "intel"
 url = "https://pytorch-extension.intel.com/release-whl/stable/xpu/us/"
-# priority = "explicit"
 
-# PyPI should be implicitly available or can be added if needed:
+# PyPI is typically used by default by Poetry if a package isn't found in other defined sources.
+# You can add it explicitly if needed, e.g.:
 # [[source]]
 # name = "PyPI"
-# priority = "default" # or "supplemental"
-
+# priority = "supplemental" # or "default" if it's the primary one and others are secondary.
 
 [tool.ruff.lint.extend-per-file-ignores]
 "__init__.py" = ["E402","F403",'F401']
