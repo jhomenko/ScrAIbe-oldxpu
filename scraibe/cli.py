@@ -123,15 +123,20 @@ def cli():
 
     # --- Perform tasks ---
     audio_files_to_process = arg_dict.pop("audio_files")
+    # Ensure out_folder and output_file_format are defined before this loop from arg_dict
+    # out_folder = arg_dict.pop("output_directory")
+    # os.makedirs(out_folder, exist_ok=True)
+    # output_file_format = arg_dict.pop("output_format")
+
 
     if audio_files_to_process:
-        # Pop method-specific arguments once before the loop
         language_arg = arg_dict.pop("language")
         verbose_arg = arg_dict.pop("verbose_output")
         num_speakers_arg = arg_dict.pop("num_speakers")
 
         for audio_file_path in audio_files_to_process:
             base_filename = os.path.splitext(os.path.basename(audio_file_path))[0]
+            # Ensure 'out_folder' is defined from popped 'output_directory' before this loop
             output_path_base = os.path.join(out_folder, base_filename)
 
             print(f"\nProcessing: {audio_file_path}")
@@ -144,65 +149,101 @@ def cli():
                     'language': language_arg,
                     'verbose': verbose_arg,
                 }
-                if num_speakers_arg is not None: # Only pass num_speakers if provided
+                if num_speakers_arg is not None:
                     autotranscribe_params['num_speakers'] = num_speakers_arg
 
-                out = model.autotranscribe(audio_file_path, **autotranscribe_params)
+                transcript_obj = model.autotranscribe(audio_file_path, **autotranscribe_params) # Renamed to transcript_obj
                 
-                # Assuming 'out' is an object with a save method like: out.save(path, format=output_file_format)
-                # If 'out' is just the text for .txt, and dict for .json etc., saving needs to adapt.
-                # For now, let's assume a versatile save method or specific handling.
-                print(f'Saving to {output_path_base} with format {output_file_format}')
-                if hasattr(out, 'save_to_file'): # Ideal
-                     out.save_to_file(output_path_base, format=output_file_format)
-                elif output_file_format == 'txt' and isinstance(out, str): # Simple text case
-                     with open(f"{output_path_base}.txt", "w", encoding='utf-8') as f:
-                        f.write(out)
-                elif output_file_format == 'json' and isinstance(out, dict): # Simple dict case for JSON
-                     with open(f"{output_path_base}.json", "w", encoding='utf-8') as f:
-                        json.dump(out, f, indent=2)
-                else: # Fallback or more complex save logic from Scraibe output object
-                    # This part needs to align with how your Scraibe output objects work.
-                    # The original code had out.save(path_with_extension)
-                    # Let's assume the output object `out` from autotranscribe has a method `save(filepath_with_extension)`
-                    # And it infers format from extension or you need to pass it.
-                    # For simplicity, if your original `out.save()` worked, that's fine.
-                    # This example makes the output filename include the format.
-                    save_path = f"{output_path_base}.{output_file_format}"
-                    if hasattr(out, 'save'):
-                        out.save(save_path) # Assuming out.save handles the format based on extension or internally
-                    else:
-                        print(f"Warning: Output object from autotranscribe doesn't have a 'save' or 'save_to_file' method. Cannot save {output_file_format}.")
+                save_path_with_extension = f"{output_path_base}.{output_file_format}"
+                print(f'Attempting to save autotranscribe output to {save_path_with_extension}')
+
+                saved_successfully = False
+                if hasattr(transcript_obj, 'save'): # Ideal: Transcript object has a save method
+                    try:
+                        transcript_obj.save(save_path_with_extension) # Assumes .save() handles format by extension or internal logic
+                        saved_successfully = True
+                    except Exception as e:
+                        print(f"Warning: transcript_obj.save() failed: {e}")
+                elif hasattr(transcript_obj, 'save_to_file'): # Alternative save method signature
+                     try:
+                        transcript_obj.save_to_file(output_path_base, format=output_file_format)
+                        saved_successfully = True
+                     except Exception as e:
+                        print(f"Warning: transcript_obj.save_to_file() failed: {e}")
+                
+                if not saved_successfully: # Fallback to manual formatting if no general save method worked
+                    if output_file_format == 'txt':
+                        try:
+                            text_content = str(transcript_obj) # Relies on __str__ or a .to_text() method
+                            if hasattr(transcript_obj, 'to_text'): text_content = transcript_obj.to_text()
+                            with open(save_path_with_extension, "w", encoding='utf-8') as f:
+                                f.write(text_content)
+                            saved_successfully = True
+                        except Exception as e:
+                            print(f"Warning: Could not convert autotranscribe output to TXT or save: {e}")
+                    elif output_file_format == 'json':
+                        try:
+                            if hasattr(transcript_obj, 'to_dict'):
+                                dict_content = transcript_obj.to_dict()
+                                with open(save_path_with_extension, "w", encoding='utf-8') as f:
+                                    json.dump(dict_content, f, indent=2)
+                                saved_successfully = True
+                            else:
+                                print(f"Warning: Transcript object does not have a to_dict() method for JSON export.")
+                        except Exception as e:
+                            print(f"Warning: Could not convert autotranscribe output to JSON or save: {e}")
+                
+                if not saved_successfully:
+                    print(f"Warning: Failed to save output for {audio_file_path} in format {output_file_format}.")
 
 
             elif task_to_perform == "diarization":
-                if verbose_arg: # Check the verbose_arg captured before loop
-                    print("Performing diarization...") # Simple verbose message
+                if verbose_arg:
+                    print("Performing diarization...")
                 
-                # Assuming model.diarization returns a JSON serializable dict/list
-                diarization_result = model.diarization(audio_file_path, num_speakers=num_speakers_arg) # Pass num_speakers if diarizer uses it
+                diarization_result_dict = model.diarization(audio_file_path, num_speakers=num_speakers_arg)
                 
-                save_path = f"{output_path_base}.json" # Diarization often saved as JSON
+                save_path = f"{output_path_base}.json" # Diarization defaults to JSON
                 print(f'Saving diarization result to {save_path}')
-                with open(save_path, "w", encoding='utf-8') as f:
-                    json.dump(diarization_result, f, indent=2)
+                try:
+                    with open(save_path, "w", encoding='utf-8') as f:
+                        json.dump(diarization_result_dict, f, indent=2)
+                except Exception as e:
+                    print(f"Error saving diarization JSON for {audio_file_path}: {e}")
 
 
             elif task_to_perform == "transcribe" or task_to_perform == "translate":
-                # Assuming model.transcribe returns the transcribed text directly as a string
-                transcribed_text = model.transcribe(
+                # CRITICAL FIX: Assign to 'transcription_output_dict' (or any name, e.g. 'out')
+                transcription_output_dict = model.transcribe(
                     audio_file_path, 
-                    task=task_to_perform, # 'transcribe' or 'translate'
+                    task=task_to_perform,
                     language=language_arg,
                     verbose=verbose_arg
                 )
-                save_path = f"{output_path_base}.txt" # Default to .txt for direct transcription
-                if output_file_format != 'txt':
-                    print(f"Warning: Direct transcribe/translate task defaults to .txt output. Requested format '{output_file_format}' may not be suitable if output is plain text.")
                 
-                print(f'Saving transcription to {save_path}')
-                with open(save_path, "w", encoding='utf-8') as f:
-                    f.write(out.get("text", "")) # <--- Get the 'text' string from the dictionary
+                save_path = f"{output_path_base}.txt" # Default to .txt
+                
+                # Optional: Handle other formats if model.transcribe output (a dict) supports them
+                if output_file_format == 'json':
+                    save_path = f"{output_path_base}.json"
+                    print(f'Saving full transcription dictionary to {save_path}')
+                    try:
+                        with open(save_path, "w", encoding='utf-8') as f:
+                            json.dump(transcription_output_dict, f, indent=2) # Save the whole dict
+                    except Exception as e:
+                        print(f"Error saving transcription JSON for {audio_file_path}: {e}")
+                else: # Default to saving only text to .txt
+                    if output_file_format != 'txt':
+                        print(f"Warning: Transcription task with output format '{output_file_format}' will save text to .txt. "
+                              f"For full dictionary, use --output-format json.")
+                    
+                    print(f'Saving transcription text to {save_path}')
+                    try:
+                        with open(save_path, "w", encoding='utf-8') as f:
+                            # Use the SAME variable name here that holds the dictionary
+                            f.write(transcription_output_dict.get("text", "")) 
+                    except Exception as e:
+                        print(f"Error saving transcription text for {audio_file_path}: {e}")
     else:
         print("No audio files provided. Use the -f or --audio-files flag.")
 
