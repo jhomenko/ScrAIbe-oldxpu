@@ -30,7 +30,7 @@ exclude =[
 ]
 
 [tool.poetry.dependencies]
-python = "^3.9" # Or ^3.11 as per ipex-llm quickstart
+python = "^3.11" # Or ^3.11 as per ipex-llm quickstart
 
 # Core application dependencies
 tqdm = "^4.66.5"
