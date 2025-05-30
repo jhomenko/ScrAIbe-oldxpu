@@ -101,87 +101,40 @@ except ImportError:
 ModelType = TypeVar('ModelType')
 
 
-class Transcriber(ABC):
-    """
-    Abstract Base Class for Transcriber implementations.
-    """
-
-    def __init__(self, model_name: str, model_instance: ModelType, processor: Optional[Any] = None) -> None:
-        """
-        Initialize the Transcriber class.
-
-        Args:
-            model_name (str): The name of the model (e.g., "tiny", "medium").
-            model_instance (ModelType): The loaded transcription model instance.
-            processor (Optional[Any]): An optional processor object (e.g., for Hugging Face models).
-        """
+class Transcriber(ABC): # Your existing ABC
+    def __init__(self, model_name: str, model_instance: Any, processor: Optional[Any] = None, verbose: bool = False) -> None:
         self.model_name = model_name
         self.model = model_instance
         self.processor = processor
+        self.verbose = verbose # Added verbose to base for consistency
 
     @abstractmethod
-    def transcribe(self, audio: Union[str, Tensor, ndarray], **kwargs) -> Dict[str, Any]:
-        """
-        Transcribe an audio file or audio data.
-
-        Args:
-            audio (Union[str, Tensor, ndarray]): Path to audio file, or audio data as Tensor/ndarray.
-            **kwargs: Additional keyword arguments specific to the transcriber implementation.
-
-        Returns:
-            Dict[str, Any]: A dictionary containing at least a "text" key with the full transcript.
-                            Optionally, it can include "segments" (list of dicts with start, end, text),
-                            "language", and other metadata.
-        """
+    def transcribe(self, audio: Union[str, Tensor, np.ndarray], **kwargs) -> Dict[str, Any]:
         pass
 
     @staticmethod
     def save_transcript(transcript_data: Dict[str, Any], save_path: str) -> None:
-        """
-        Save the transcribed text to a file.
-
-        Args:
-            transcript_data (Dict[str, Any]): The dictionary returned by the transcribe method.
-            save_path (str): The path to save the transcript text file.
-        """
         text_content = transcript_data.get("text", "")
-        if not text_content and "segments" in transcript_data: # Reconstruct if only segments given
+        if not text_content and "segments" in transcript_data:
             text_content = " ".join(seg.get("text", "") for seg in transcript_data["segments"]).strip()
-
         with open(save_path, 'w', encoding='utf-8') as f:
             f.write(text_content)
-        print(f'Transcript text saved to {save_path}')
-        # Optionally, save segments to a separate file or a structured format like JSON if needed.
+        if os.path.exists(save_path) and os.path.getsize(save_path) > 0: # Check if file was actually written
+            print(f'Transcript text saved to {save_path}')
+        else:
+            print(f'Warning: Transcript text file at {save_path} is empty or was not saved.')
+
 
     @classmethod
     @abstractmethod
-    def load_model(cls,
-                   model_name: str,
-                   download_root: Optional[str] = WHISPER_DEFAULT_PATH,
-                   device_option: Optional[Union[str, device]] = SCRAIBE_TORCH_DEVICE,
-                   **kwargs: Any
-                   ) -> 'Transcriber':
-        """
-        Load the transcription model.
-
-        Args:
-            model_name (str): Name or path of the Whisper model.
-            download_root (Optional[str]): Path to download/cache models.
-            device_option (Optional[Union[str, device]]): Device to load the model on.
-            **kwargs: Additional arguments specific to the model type or optimization.
-
-        Returns:
-            Transcriber: An instance of a Transcriber subclass.
-        """
+    def load_model(cls, model_name: str, download_root: Optional[str] = None,
+                   device_option: Optional[Union[str, device]] = None,
+                   **kwargs: Any) -> 'Transcriber':
         pass
 
-    @staticmethod
-    @abstractmethod
-    def _get_transcribe_kwargs(**kwargs: Any) -> Dict[str, Any]:
-        """
-        Filter and prepare keyword arguments for the specific model's transcribe method.
-        """
-        pass
+    # Removed abstract _get_transcribe_kwargs from ABC as it's too specific to implementation
+    # def _get_transcribe_kwargs(**kwargs: Any) -> Dict[str, Any]:
+    #     pass
 
     def __repr__(self) -> str:
         return f"{self.__class__.__name__}(model_name='{self.model_name}')"
@@ -189,60 +142,50 @@ class Transcriber(ABC):
 class OpenAIWhisperIPEXLLMTranscriber(Transcriber):
     """
     Transcriber for OpenAI's Whisper model, using ipex_llm.transformers for loading
-    and optimization, especially for Intel XPUs.
+    and optimization. Relies on the model's internal long-form transcription capabilities.
     """
     def __init__(self, 
                  model_name: str, 
-                 model_instance: AutoModelForSpeechSeq2Seq, # Model instance is now from ipex_llm.transformers
-                 processor_instance: WhisperProcessor,    # Explicitly store processor
+                 model_instance: AutoModelForSpeechSeq2Seq,
+                 processor_instance: WhisperProcessor,
                  target_device: torch.device,
-                 low_bit_format: Optional[str] = None):   # Store low_bit for reference
-        
-        # Call super().__init__ using the new 'processor' argument in the ABC if you've added it,
-        # or handle it as needed. For now, let's assume the ABC's __init__ is:
-        # super().__init__(model_name, model_instance, processor_instance)
-        # If your Transcriber ABC's __init__ is still (model_name, model_instance), 
-        # you'll store processor separately:
-        self.model_name = model_name
-        self.model = model_instance
-        self.processor = processor_instance # Store the WhisperProcessor
+                 low_bit_format: Optional[str] = None,
+                 verbose: bool = False): # Accept verbose
+        super().__init__(model_name, model_instance, processor_instance, verbose=verbose)
+        # self.model and self.processor are set by super()
         self.target_device = target_device
         self.low_bit_format = low_bit_format
-        self.verbose = False # Or get from kwargs if needed
+        # self.verbose is set by super()
 
     @classmethod
     def load_model(cls,
                    model_name: str = "medium",
-                   download_root: Optional[str] = None,
+                   download_root: Optional[str] = None, 
                    device_option: Optional[Union[str, torch.device]] = None,
-                   use_ipex_llm: bool = True, # This class is IPEX-LLM specific
-                   low_bit: str = 'bf16',    # Controls quantization: "bf16", "fp16", "int4", "sym_int4", etc.
+                   use_ipex_llm: bool = True, 
+                   low_bit: str = 'bf16', 
                    use_auth_token: Optional[str] = None,
-                   in_memory: bool = False, # Kept for signature compatibility if needed by other parts
-                   verbose: bool = False,   # Pass verbose flag for loader prints
-                   **kwargs: Any 
+                   verbose: bool = False, # For loader prints, also passed to __init__
+                   **kwargs: Any # Catches in_memory, trust_remote_code etc.
                    ) -> 'OpenAIWhisperIPEXLLMTranscriber':
 
-        if not use_ipex_llm or ipex_llm is None: # Ensure ipex_llm is available
-            raise ImportError("IPEX-LLM library not found or use_ipex_llm is False. "
-                              "Cannot use OpenAIWhisperIPEXLLMTranscriber.")
+        if not use_ipex_llm or ipex_llm is None:
+            raise ImportError("IPEX-LLM library not found or use_ipex_llm is False for OpenAIWhisperIPEXLLMTranscriber.")
 
         target_device_str = str(device_option if device_option else SCRAIBE_TORCH_DEVICE)
         target_device = torch.device(target_device_str)
 
-        # Map short model names to full Hugging Face Hub identifiers
         hf_model_id = model_name
         official_short_names = ["tiny", "base", "small", "medium", "large", "large-v2", "large-v3"]
         potential_short_name = model_name.replace(".en", "")
         if potential_short_name in official_short_names and "/" not in model_name:
-            hf_model_id = f"openai/whisper-{model_name}"
+            hf_model_id = f"openai/whisper-{model_name}" # Construct full ID for OpenAI models
             if verbose: print(f"Interpreted model_name '{model_name}' as Hugging Face ID '{hf_model_id}'")
 
         if verbose:
             print(f"Loading Whisper model '{hf_model_id}' using ipex_llm.transformers "
-                  f"with low_bit configuration: '{low_bit}' for device '{target_device_str}'")
+                  f"with low_bit config: '{low_bit}' for device '{target_device_str}'")
 
-        # Load WhisperProcessor
         try:
             processor = WhisperProcessor.from_pretrained(
                 hf_model_id, cache_dir=download_root, token=use_auth_token
@@ -251,108 +194,145 @@ class OpenAIWhisperIPEXLLMTranscriber(Transcriber):
             warnings.warn(f"Failed to load WhisperProcessor for '{hf_model_id}': {e}", RuntimeWarning)
             raise
 
-        # Prepare arguments for AutoModelForSpeechSeq2Seq.from_pretrained
-        from_pretrained_main_args = {} # For load_in_4bit or load_in_low_bit
-        from_pretrained_other_kwargs = kwargs.copy() # For other passthrough args
-        from_pretrained_other_kwargs.setdefault('trust_remote_code', True)
-        from_pretrained_other_kwargs['cache_dir'] = download_root
-        from_pretrained_other_kwargs['token'] = use_auth_token
+        from_pretrained_args = kwargs.copy() # Start with pass-through kwargs
+        from_pretrained_args.setdefault('trust_remote_code', True)
+        from_pretrained_args['cache_dir'] = download_root
+        from_pretrained_args['token'] = use_auth_token
         
-        # Add cpu_embedding=True for XPU device, based on IPEX-LLM docs
         if target_device.type == 'xpu':
-            from_pretrained_other_kwargs.setdefault('cpu_embedding', True)
+            from_pretrained_args.setdefault('cpu_embedding', True)
             if verbose: print(f"INFO: Setting cpu_embedding=True for XPU device.")
 
         normalized_low_bit = low_bit.lower() if isinstance(low_bit, str) else ""
-        effective_torch_dtype = "auto" # Default, let IPEX-LLM / Transformers decide
+        effective_torch_dtype = "auto" 
 
-        # Path for boolean 4-bit loading (like the INT4 example script)
-        if normalized_low_bit in ["int4", "4bit"]: # User explicitly asks for generic 4-bit
+        if normalized_low_bit in ["int4", "4bit"]: 
             if verbose: print(f"INFO: Using INT4 settings: load_in_4bit=True, optimize_model=False (for low_bit='{low_bit}')")
-            from_pretrained_main_args['load_in_4bit'] = True
-            from_pretrained_main_args['optimize_model'] = False 
-            # For load_in_4bit, torch_dtype is typically not specified or "auto"
-            effective_torch_dtype = None # Let IPEX-LLM handle dtype for this pure 4-bit loading
-        
-        # Path for specific named low_bit formats (like bf16, fp16, or specific int strings like "sym_int4")
-        else:
-            if verbose: print(f"INFO: Using specific low_bit string: load_in_low_bit='{low_bit}', optimize_model=True")
-            from_pretrained_main_args['load_in_low_bit'] = low_bit # Pass the string e.g., "bf16", "sym_int4"
-            from_pretrained_main_args['optimize_model'] = True  # Generally True for specific low_bit optimizations
+            from_pretrained_args['load_in_4bit'] = True
+            from_pretrained_args['optimize_model'] = False 
+            effective_torch_dtype = None 
+        else: # For "bf16", "fp16", or other specific low_bit strings like "sym_int4", "woq_int4"
+            if verbose: print(f"INFO: Using: load_in_low_bit='{low_bit}', optimize_model=True")
+            from_pretrained_args['load_in_low_bit'] = low_bit 
+            from_pretrained_args['optimize_model'] = True  
 
-            if normalized_low_bit == "bf16":
-                effective_torch_dtype = torch.bfloat16
-            elif normalized_low_bit == "fp16":
-                effective_torch_dtype = torch.float16
-                if target_device.type == 'cpu':
-                    warnings.warn("FP16 may not be optimal on CPU for all operations.", UserWarning)
-            elif normalized_low_bit in ["fp32", "none", ""]: # Explicit FP32 or no quantization
-                effective_torch_dtype = torch.float32
-                # If low_bit was specifically to turn off quantization, clear load_in_low_bit
-                if 'load_in_low_bit' in from_pretrained_main_args and (normalized_low_bit in ["fp32", "none", ""]):
-                    from_pretrained_main_args.pop('load_in_low_bit')
-            else: # For other specific quantization strings (e.g., "sym_int4", "nf4")
-                  # let IPEX-LLM infer/handle the torch_dtype.
-                effective_torch_dtype = None 
+            torch_dtype_map = {'bf16': torch.bfloat16, 'fp16': torch.float16, 'fp32': torch.float32}
+            if normalized_low_bit in torch_dtype_map:
+                effective_torch_dtype = torch_dtype_map[normalized_low_bit]
+                if normalized_low_bit == "fp16" and target_device.type == 'cpu':
+                    warnings.warn("FP16 may not be optimal on CPU.", UserWarning)
+            elif normalized_low_bit in ["fp32", "none", ""]: # Explicit FP32 or no quant
+                if 'load_in_low_bit' in from_pretrained_args : from_pretrained_args.pop('load_in_low_bit')
+            else: # For other specific quant strings (e.g., "sym_int4", "nf4", "woq_int4")
+                effective_torch_dtype = None # Let IPEX-LLM handle dtype
 
-        # Set torch_dtype if it's determined and not 'auto' or None
         if effective_torch_dtype is not None and effective_torch_dtype != "auto":
-            from_pretrained_main_args['torch_dtype'] = effective_torch_dtype
-        # If effective_torch_dtype ended up as None (e.g. for int4 or specific quant strings),
-        # ensure torch_dtype is not in main_args to let from_pretrained default.
-        elif 'torch_dtype' in from_pretrained_main_args and effective_torch_dtype is None:
-            from_pretrained_main_args.pop('torch_dtype')
-
-        # Combine all arguments for from_pretrained
-        final_from_pretrained_args = {**from_pretrained_main_args, **from_pretrained_other_kwargs}
+            from_pretrained_args['torch_dtype'] = effective_torch_dtype
+        elif 'torch_dtype' in from_pretrained_args and effective_torch_dtype is None:
+             from_pretrained_args.pop('torch_dtype', None)
 
         if verbose:
-            print(f"DEBUG: Final from_pretrained arguments for model loading: {final_from_pretrained_args}")
+            print(f"DEBUG: Final from_pretrained arguments for model loading: {from_pretrained_args}")
 
         try:
-            model_instance = AutoModelForSpeechSeq2Seq.from_pretrained(
-                hf_model_id,
-                **final_from_pretrained_args
-            )
+            model_instance = AutoModelForSpeechSeq2Seq.from_pretrained(hf_model_id, **from_pretrained_args)
         except Exception as e:
-            warnings.warn(f"Failed to load model '{hf_model_id}' using IPEX-LLM with args {final_from_pretrained_args}: {e}", RuntimeWarning)
+            warnings.warn(f"Failed to load model '{hf_model_id}' with args {from_pretrained_args}: {e}", RuntimeWarning)
             raise
 
         model_instance = model_instance.eval()
-
         try:
             model_instance = model_instance.to(target_device)
             loaded_model_dtype = next(model_instance.parameters()).dtype
             print(f"IPEX-LLM Whisper model '{hf_model_id}' loaded. Target device: '{target_device}'. "
                   f"Effective model dtype: {loaded_model_dtype}. Low-bit config: '{low_bit}'.")
         except Exception as e:
-            warnings.warn(f"Failed to move IPEX-LLM loaded model to '{target_device}': {e}. "
-                          f"Model remains on its current device: {model_instance.device}", RuntimeWarning)
-            target_device = model_instance.device
+            warnings.warn(f"Failed to move model to '{target_device}': {e}. Using device: {model_instance.device}", RuntimeWarning)
+            target_device = model_instance.device # Update to actual device
 
-        return cls(hf_model_id, model_instance, processor, target_device, low_bit_format=low_bit)
+        return cls(hf_model_id, model_instance, processor, target_device, low_bit_format=low_bit, verbose=verbose)
 
-    def _pad_or_trim_features(self, features: torch.Tensor, length: int = N_FRAMES_PER_CHUNK) -> torch.Tensor:
-        """Pads or trims the input mel spectrogram features to a specified length."""
-        if features.shape[-1] > length:
-            features = features[..., :length]
-        elif features.shape[-1] < length:
-            padding = length - features.shape[-1]
-            features = torch.nn.functional.pad(features, (0, padding))
-        return features
+    def _get_transcribe_kwargs(self, **kwargs: Any) -> Dict[str, Any]:
+        """
+        Prepare keyword arguments for the model's `generate` method,
+        which handles long-form transcription and timestamping internally.
+        """
+        generate_params = {}
+        
+        # Parameters from `transformers.WhisperForConditionalGeneration.generate` signature
+        # and common GenerationConfig parameters.
+        known_options = [
+            "language", "task", "temperature", "compression_ratio_threshold", 
+            "logprob_threshold", "no_speech_threshold", "condition_on_prev_tokens",
+            "initial_prompt", "prompt_ids", "decoder_input_ids",
+            "return_timestamps", "return_token_timestamps", 
+            "num_beams", "patience", "length_penalty", "repetition_penalty",
+            "no_repeat_ngram_size", "suppress_tokens", "begin_suppress_tokens",
+            "max_length", "max_new_tokens", 
+            "use_cache", "do_sample", "top_k", "top_p",
+            "return_dict_in_generate",
+            # These are specific to the generate method you found, not generic GenerationConfig
+            "is_multilingual", "num_segment_frames", "time_precision", "time_precision_features",
+            "return_segments", "force_unique_generate_call", "prompt_condition_type"
+        ]
+
+        for k, v in kwargs.items():
+            if k in known_options:
+                generate_params[k] = v
+            elif k == "beam_size" and "num_beams" not in generate_params: # Map CLI --beam_size
+                 generate_params["num_beams"] = v
+            elif k == "word_timestamps" and v is True: # User wants word timestamps
+                 generate_params["return_token_timestamps"] = True
+                 generate_params.setdefault("return_timestamps", True) 
+
+        # --- Sensible Defaults for robust long-form transcription ---
+        generate_params.setdefault('language', None) 
+        generate_params.setdefault('task', "transcribe")
+        generate_params.setdefault('return_timestamps', True) 
+        generate_params.setdefault('return_dict_in_generate', True) 
+        generate_params.setdefault('condition_on_prev_tokens', True)
+        generate_params.setdefault('temperature', (0.0, 0.2, 0.4, 0.6, 0.8, 1.0))
+        generate_params.setdefault('num_beams', kwargs.get('num_beams', 1)) # Use CLI num_beams, default 1
+        
+        if generate_params['num_beams'] > 1:
+            generate_params['do_sample'] = False
+        
+        generate_params.setdefault('use_cache', True)
+        
+        # To avoid the "short-form temperature tuple error" if model.generate uses a strict check:
+        # If return_timestamps is True (implying long-form), the model *should* accept the tuple.
+        # If it still errors, this might need adjustment based on model's internal logic.
+        # For now, we pass the tuple as the HF generate signature suggests it can handle it for its fallback.
+        # The ValueError about temperature tuple and "short-form" means the generate() method,
+        # for its *first internal chunk*, might be applying short-form validation.
+        # A possible workaround if error persists: pass only temperatures[0] if it's for first chunk logic.
+        # However, the `whisper_generate` signature itself takes the tuple.
+
+        # If it's pure greedy, some transformers versions warn if temp=0.0 is passed with do_sample=False.
+        current_temp = generate_params.get('temperature')
+        first_temp_val = current_temp[0] if isinstance(current_temp, (list,tuple)) and current_temp else current_temp
+        if generate_params.get('num_beams',1) == 1 and \
+           not generate_params.get('do_sample', False) and \
+           (first_temp_val == 0.0): # Greedy conditions
+            # It's fine to pass temp=0.0 for greedy. Some old versions warned.
+            pass
+
+        return generate_params
 
     def transcribe(self, audio: Union[str, torch.Tensor, np.ndarray], **kwargs: Any) -> Dict[str, Any]:
         """
-        Transcribe audio using the IPEX-LLM loaded Whisper model's internal long-form
-        processing capabilities and timestamp generation.
+        Transcribe audio using the IPEX-LLM loaded Whisper model's internal
+        long-form processing capabilities by calling model.generate() once.
         """
         if not self.processor or not self.model:
             raise RuntimeError("Transcriber is not properly initialized with a model and processor.")
 
-        if "verbose" in kwargs: self.verbose = kwargs["verbose"]
+        # self.verbose is now set in __init__ based on Scraibe's verbose flag
+        # Allow per-call override if 'verbose' is in kwargs
+        current_call_verbose = kwargs.get("verbose", self.verbose)
 
         if isinstance(audio, str):
-            raise NotImplementedError("This method expects a pre-processed waveform Tensor.")
+            raise NotImplementedError("This transcribe method expects a pre-processed waveform Tensor.")
         elif isinstance(audio, np.ndarray):
             audio_waveform = torch.from_numpy(audio.astype(np.float32))
         elif isinstance(audio, torch.Tensor):
@@ -360,202 +340,142 @@ class OpenAIWhisperIPEXLLMTranscriber(Transcriber):
         else:
             raise TypeError(f"Expected audio to be Tensor or ndarray, got {type(audio)}")
 
-        if audio_waveform.ndim > 1: audio_waveform = audio_waveform.squeeze()
+        if audio_waveform.ndim > 1: audio_waveform = audio_waveform.squeeze(0)
         if audio_waveform.ndim != 1: raise ValueError(f"Audio waveform must be 1D, got {audio_waveform.ndim} dims.")
 
-        if self.verbose: print(f"Processing full audio waveform (duration: {audio_waveform.shape[0]/SAMPLE_RATE:.2f}s) with self.processor...")
+        if current_call_verbose: 
+            print(f"Processing full audio waveform (duration: {audio_waveform.shape[0]/SAMPLE_RATE:.2f}s) with self.processor...")
+        
         try:
-            input_features = self.processor(
-                audio_waveform.cpu().numpy(), sampling_rate=SAMPLE_RATE, return_tensors="pt"
-            ).input_features
+            # Important: process the *entire* audio, ensure no truncation by processor by default
+            # and get attention_mask.
+            inputs = self.processor(
+                audio_waveform.cpu().numpy(), 
+                sampling_rate=SAMPLE_RATE, 
+                return_tensors="pt",
+                return_attention_mask=True # Crucial for long audio in generate
+            )
+            input_features = inputs.input_features
+            attention_mask = inputs.get("attention_mask")
         except Exception as e:
             warnings.warn(f"Error during full audio feature extraction: {e}", RuntimeWarning)
             raise
 
         model_dtype = next(self.model.parameters()).dtype
-        if input_features.device != self.target_device:
-            input_features = input_features.to(self.target_device)
-        if input_features.dtype != model_dtype:
-            if self.verbose: print(f"Casting full_input_features from {input_features.dtype} to model dtype {model_dtype}")
-            input_features = input_features.to(model_dtype)
+        try:
+            if input_features.device != self.target_device:
+                input_features = input_features.to(self.target_device)
+            if input_features.dtype != model_dtype:
+                if current_call_verbose: print(f"Casting full_input_features from {input_features.dtype} to model dtype {model_dtype}")
+                input_features = input_features.to(model_dtype)
+            if attention_mask is not None and attention_mask.device != self.target_device:
+                attention_mask = attention_mask.to(self.target_device)
+        except Exception as e:
+             warnings.warn(f"Could not move/cast input_features/attention_mask to target device/dtype: {e}", RuntimeWarning)
 
         generate_options = self._get_transcribe_kwargs(**kwargs)
-        final_language = generate_options.get("language", "en") # Tentative, generate might update this
+        # Language for the final returned dict. Generate might also return detected language.
+        # Default to 'en' if not specified and not detected.
+        final_language_to_report = generate_options.get("language") 
 
-        if self.verbose:
-            print(f"Calling self.model.generate() for full audio. Effective options: {generate_options}")
+        if current_call_verbose:
+            print(f"Calling self.model.generate() for full audio. Effective options passed: {generate_options}")
             print(f"Model device: {self.model.device}, Input features device: {input_features.device}, dtype: {input_features.dtype}")
+            if attention_mask is not None: print(f"Attention mask shape: {attention_mask.shape}, device: {attention_mask.device}")
 
         full_text = ""
-        segments = []
+        segments_data = []
 
         with torch.no_grad():
             try:
-                # Call generate once. The model's internal whisper_generate handles chunking.
-                # Ensure options like return_timestamps=True are passed.
-                # The generate function you provided has many specific args, make sure they are in generate_options.
+                # The `generate` method of WhisperForConditionalGeneration internally handles chunking
+                # when provided with long input_features and appropriate parameters like return_timestamps=True.
                 output = self.model.generate(
-                    input_features,
-                    **generate_options  # Pass all prepared options
+                    inputs=input_features, # In Transformers >=4.31, `inputs` can be input_features
+                                           # For older, it might need to be `input_features=input_features`
+                    attention_mask=attention_mask,
+                    **generate_options 
                 )
 
                 if self.target_device.type == "xpu":
                     torch.xpu.synchronize()
 
-                # Process the output from model.generate()
-                # If return_dict_in_generate=True, output should be a dict-like object.
-                # If it returns a list of dicts for segments directly (like HF pipeline with return_segments=True):
-                if isinstance(output, dict) and "chunks" in output : # Matches HF pipeline output with chunking
-                    # This format usually comes from ASR pipeline with chunking
-                    segments_raw = output["chunks"]
-                    full_text_parts = []
-                    for i, segment_data in enumerate(segments_raw):
-                        text = segment_data.get("text", "").strip()
-                        full_text_parts.append(text)
-                        segments.append({
-                            "id": i,
-                            "seek": 0, # Placeholder, seek isn't directly from this output format
-                            "start": segment_data["timestamp"][0] if segment_data.get("timestamp") else 0.0,
-                            "end": segment_data["timestamp"][1] if segment_data.get("timestamp") and segment_data["timestamp"][1] is not None else audio_waveform.shape[0]/SAMPLE_RATE,
-                            "text": text,
-                            # Tokens, temp, logprob etc. are not in this pipeline output format directly per segment
-                        })
-                    full_text = " ".join(full_text_parts).strip()
-                    if self.verbose: print("Processed 'chunks' from generate output.")
-
-                elif isinstance(output, torch.Tensor): # If it's just token IDs
-                    full_text = self.processor.batch_decode(output, skip_special_tokens=True)[0].strip()
-                    # Basic segment for the whole text if no detailed segments
-                    if full_text:
-                        segments.append({"id": 0, "seek": 0, "start": 0.0, "end": audio_waveform.shape[0]/SAMPLE_RATE, "text": full_text, "tokens": output.squeeze().tolist()})
-                    warnings.warn("model.generate() returned raw token IDs. Detailed segments and timestamps may be missing. "
-                                  "Ensure 'return_timestamps=True' and 'return_dict_in_generate=True' are effective.", UserWarning)
+                # Process output
+                # `output` is a GenerationOutput object if return_dict_in_generate=True
+                # or a tensor of token IDs otherwise.
                 
-                # Placeholder: Extract language if model's output provides it
-                # final_language = output.get("language", final_language) if isinstance(output, dict) else final_language
+                predicted_ids = output.sequences if hasattr(output, "sequences") else output
+                
+                # Get overall text
+                # Important: The generate method with internal chunking should ideally provide the full text.
+                # If it returns per-chunk text in a structured way, we'd assemble it.
+                # For now, let's assume batch_decode on the full predicted_ids gives the coherent full text.
+                full_text = self.processor.batch_decode(predicted_ids, skip_special_tokens=True)[0].strip()
+
+                # Extract segments if the output structure supports it
+                # This part is highly dependent on what `self.model.generate` returns with IPEX-LLM
+                # and if it mirrors the HF pipeline's "chunks" or Whisper's "segments" structure.
+                raw_segments = None
+                if hasattr(output, "segments"): # e.g., if generate was patched to return this
+                    raw_segments = output.segments
+                elif hasattr(output, "chunks"): # e.g., if it mimics pipeline output
+                    raw_segments = output.chunks
+                # If `return_token_timestamps=True` was passed and effective, `output` might contain `token_timestamps`
+                # which would require more complex logic to build segments.
+
+                if raw_segments and isinstance(raw_segments, list):
+                    for i, seg_data_from_model in enumerate(raw_segments):
+                        # Adapt to the actual structure of seg_data_from_model
+                        text = seg_data_from_model.get("text", "").strip()
+                        # Timestamps might be a tuple e.g. {"timestamp": (start, end)} in pipeline chunks
+                        ts = seg_data_from_model.get("timestamp")
+                        start_time = ts[0] if isinstance(ts, (list, tuple)) and len(ts) > 0 else 0.0
+                        end_time = ts[1] if isinstance(ts, (list, tuple)) and len(ts) > 1 and ts[1] is not None else start_time + 1.0 # Placeholder end
+                        
+                        segments_data.append({
+                            "id": i, "seek": 0, # Seek is less relevant if generate handles full audio
+                            "start": round(float(start_time), 3), "end": round(float(end_time), 3),
+                            "text": text,
+                            "tokens": seg_data_from_model.get("tokens", []), # If available
+                        })
+                    if self.verbose: print(f"Extracted {len(segments_data)} segments from model output.")
+                elif full_text: # Fallback if no structured segments
+                    warnings.warn("Detailed segments not found in model.generate() output. "
+                                  "Creating a single segment. Check if 'return_timestamps' or similar options are effective.", UserWarning)
+                    segments_data.append({
+                        "id": 0, "seek": 0, 
+                        "start": 0.0, "end": round(audio_waveform.shape[0]/SAMPLE_RATE, 3), 
+                        "text": full_text, 
+                        "tokens": predicted_ids.squeeze().tolist() if isinstance(predicted_ids, torch.Tensor) else []
+                    })
+
+                # Language
+                # The generate method might return the detected language in the output object
+                if hasattr(output, "language"):
+                    final_language_to_report = output.language
+                elif final_language_to_report is None: # If not passed in and not in output
+                    final_language_to_report = "en" # Fallback
+
 
                 if self.verbose:
                     print(f"--- Transcription ---")
+                    print(f"Language: {final_language_to_report}")
                     print(full_text)
-                    if segments: print(f"First few segments: {segments[:2]}")
+                    if segments_data and (not raw_segments or len(segments_data) < 5):
+                        for seg in segments_data: print(f"  [{seg['start']:.3f} -> {seg['end']:.3f}] {seg['text']}")
                     print(f"--- End Transcription ---")
 
             except Exception as e:
                 warnings.warn(f"Error during model.generate() or full audio decoding: {e}", RuntimeWarning)
                 import traceback
-                traceback.print_exc() # Print full traceback
-                return {"text": "", "segments": [], "language": final_language}
+                traceback.print_exc()
+                return {"text": "", "segments": [], "language": final_language_to_report or "en"}
         
         return {
             "text": full_text,
-            "segments": segments, # These will be detailed if generate output provides them
-            "language": final_language
+            "segments": segments_data,
+            "language": final_language_to_report or "en"
         }
-
-    # _pad_or_trim_features method is NO LONGER NEEDED here if generate handles full features.
-    # The constants like N_FRAMES_PER_CHUNK are also not directly used in this version of transcribe.
-
-
-    @staticmethod
-    def _get_transcribe_kwargs(**kwargs: Any) -> Dict[str, Any]:
-        """
-        Prepare keyword arguments for the Whisper model's built-in long-form `generate` method.
-        This maps Scraibe's desired options to the specific parameters expected by
-        `transformers.WhisperForConditionalGeneration.generate`.
-        """
-        generate_params = {}
-        
-        # Parameters directly from the `whisper_generate` signature or common HF `generate`
-        known_options = [
-            "language", "task", "temperature", "compression_ratio_threshold", 
-            "logprob_threshold", "no_speech_threshold", "condition_on_prev_tokens",
-            "initial_prompt", "prompt_ids", # prompt_ids for more direct control if needed
-            "return_timestamps", "return_token_timestamps", # For detailed timestamped segments
-            "num_beams", "patience", "length_penalty", "repetition_penalty",
-            "no_repeat_ngram_size", "suppress_tokens", "begin_suppress_tokens", 
-            "max_new_tokens", "max_length", # max_length for generate, max_new_tokens for pipeline per chunk
-            "use_cache", "do_sample", "top_k", "top_p",
-            "return_dict_in_generate", "return_segments", # if generate supports these directly for Whisper
-            # These might be specific to openai-whisper or need careful mapping:
-            # "best_of", "prefix", "suppress_blank", "without_timestamps", 
-            # "max_initial_timestamp", "word_timestamps", 
-            # "prepend_punctuations", "append_punctuations"
-        ]
-
-        for k, v in kwargs.items():
-            if k in known_options:
-                generate_params[k] = v
-            elif k == "sample_len" and "max_new_tokens" not in generate_params: # Map if passed
-                generate_params["max_new_tokens"] = v
-            elif k == "beam_size" and "num_beams" not in generate_params: # Map if passed
-                 generate_params["num_beams"] = v
-            elif k == "word_timestamps" and v is True and "return_token_timestamps" not in generate_params:
-                 generate_params["return_token_timestamps"] = True
-
-
-        # --- Sensible Defaults for robust long-form transcription ---
-        generate_params.setdefault('language', None) # Let `generate` handle detection if None
-        generate_params.setdefault('task', "transcribe")
-        
-        # CRUCIAL for getting structured segments and timestamps from `generate`
-        generate_params.setdefault('return_timestamps', True) 
-        generate_params.setdefault('return_dict_in_generate', True) # To get structured output
-
-        generate_params.setdefault('condition_on_prev_tokens', True)
-        generate_params.setdefault('temperature', (0.0, 0.2, 0.4, 0.6, 0.8, 1.0)) # Pass tuple for internal fallback
-        
-        # Beam search vs. Sampling strategy (primary attempt)
-        # `generate` will use the first temperature in the tuple for its initial attempts.
-        # If num_beams > 1, it will do beam search. If temp > 0 and num_beams=1, it will sample.
-        # If temp = 0 and num_beams=1, it's greedy.
-        user_num_beams = generate_params.get('num_beams')
-        first_temp_in_tuple = generate_params['temperature'][0] if isinstance(generate_params['temperature'], (list, tuple)) else generate_params['temperature']
-
-        if user_num_beams is not None and user_num_beams > 1: # User specified beam search
-            generate_params['num_beams'] = user_num_beams
-            generate_params['do_sample'] = False
-            if first_temp_in_tuple > 0.0: # Beam search usually best with temp 0
-                warnings.warn(f"Beam search requested (num_beams={user_num_beams}) but first temperature is {first_temp_in_tuple}. "
-                              "Consider using temperature 0.0 for beam search.", UserWarning)
-        elif generate_params.get('do_sample', False): # User wants sampling
-            generate_params['num_beams'] = 1 # Ensure no beam search conflict
-        else: # Default or greedy specified
-            generate_params.setdefault('num_beams', 1) # Default to greedy if not otherwise specified
-            if generate_params['num_beams'] == 1 and first_temp_in_tuple == 0.0:
-                # Pure greedy, temperature value might not be needed by generate itself if do_sample=False
-                # but passing it as 0.0 is fine.
-                pass
-        
-        generate_params.setdefault('no_repeat_ngram_size', 0) # Default in openai-whisper, can be tuned (e.g. 3)
-        generate_params.setdefault('use_cache', True)
-
-        # max_new_tokens / max_length: The model's internal generate should handle per-segment limits.
-        # Setting a very large max_length for the overall call might be appropriate.
-        # Or rely on model's default config max_length.
-        # The pipeline example sets max_new_tokens=128 (per chunk). If our generate does internal chunking,
-        # this might be a parameter for *that* internal chunking, not the top-level call.
-        # For now, let's not set a restrictive max_length or max_new_tokens at the top level,
-        # assuming the internal chunking logic of `generate` will manage it.
-        # If needed, refer to how `chunk_length_s` and `max_new_tokens` interact in the pipeline.
-        generate_params.pop('max_new_tokens', None) # Remove if we set it before for simpler generate
-        # generate_params.setdefault('max_length', self.model.config.max_length * N_CHUNKS_ESTIMATE) # Risky
-
-        return generate_params
-
-
-# Ensure your FasterWhisperTranscriber and load_transcriber factory function are still in this file
-# The load_transcriber factory will need to call this new version of 
-# OpenAIWhisperIPEXLLMTranscriber.load_model correctly.
-# The existing call in load_transcriber:
-#   return OpenAIWhisperIPEXLLMTranscriber.load_model(
-#       model_name=model_name,
-#       download_root=download_root,
-#       device_option=target_device, # This 'device_option' is the param name in the new load_model
-#       **kwargs # kwargs here are from load_transcriber's **kwargs
-#                # which are from Scraibe.__init__'s component_kwargs.
-#                # These include `low_bit`, `use_ipex_llm`, `use_auth_token`.
-#   )
-# This call structure should still be compatible with the refactored class method.
 
 class FasterWhisperTranscriber(Transcriber):
     """
