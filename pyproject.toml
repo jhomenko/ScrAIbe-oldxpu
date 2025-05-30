@@ -90,7 +90,7 @@ name = "pytorch-xpu"
 url = "https://download.pytorch.org/whl/xpu/"
 priority = "explicit"
 
-[[stool.poetry.source]]
+[[tool.poetry.source]]
 name = "intel"
 url = "https://pytorch-extension.intel.com/release-whl/stable/xpu/us/"
 priority = "explicit"
