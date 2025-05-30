@@ -223,7 +223,7 @@ class OpenAIWhisperIPEXLLMTranscriber(Transcriber):
                 'trust_remote_code': from_pretrained_args.get('trust_remote_code', True),
                 'cache_dir': download_root, 'token': use_auth_token
             })
-            if target_device.type == 'xpu': from_pretrained_args.setdefault('cpu_embedding', True)
+            if target_device.type == 'xpu': from_pretrained_args.setdefault('cpu_embedding', False)
 
             if normalized_low_bit in ["int4", "4bit"]:
                 from_pretrained_args.update({'load_in_4bit': True, 'optimize_model': False})
