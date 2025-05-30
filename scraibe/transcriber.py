@@ -265,7 +265,7 @@ class OpenAIWhisperIPEXLLMTranscriber(Transcriber):
                         if verbose: print(f"INFO: Applying ipex.optimize(model, dtype={torch_dtype_for_hf_load}) for XPU.")
                         # For ipex.optimize, cpu_embedding is not a direct param.
                         # It's more about optimizing the existing model structure for XPU.
-                        model_instance = ipex.optimize(model_instance.eval(), dtype=torch_dtype_for_hf_load, inplace=True)
+                        model_instance = ipex.optimize(model_instance.eval(), dtype=torch_dtype_for_hf_load, inplace=True, weights_prepack=False)
                         if hasattr(model_instance, 'to'): # Optimized model should still have .to
                              model_instance = model_instance.to(target_device) # Move after optimize
                         else: # if ipex.optimize changes model type significantly
