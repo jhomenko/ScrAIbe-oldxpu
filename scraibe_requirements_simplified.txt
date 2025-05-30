@@ -1,0 +1,7 @@
+# No --extra-index-url needed here if these are standard PyPI packages
+tqdm>=4.66.5
+numpy==1.26.4 # Or use the version ipex-llm installed if different & compatible
+openai-whisper>=20231117,<20240931
+faster-whisper~=1.0.3
+pyannote.audio>=3.1.0
+# Add any other direct dependencies of scraibe not covered by ipex-llm
