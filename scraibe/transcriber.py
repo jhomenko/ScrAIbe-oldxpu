@@ -306,11 +306,15 @@ class OpenAIWhisperIPEXLLMTranscriber(Transcriber):
         if not self.processor or not self.model:
             raise RuntimeError("Transcriber is not properly initialized with a model and processor.")
 
-        self.verbose = kwargs.get("verbose", self.verbose) # Update instance verbose if passed
+        # Update instance verbose if passed in kwargs for this specific call
+        # Note: self.verbose is used for print statements within this method.
+        # The 'verbose' kwarg for Whisper's original transcribe is different and not directly applicable here.
+        # We will control verbosity of this method's prints via self.verbose.
+        # kwargs.get("verbose") here might be from Scraibe's method call, not specifically for model.generate.
+        if "verbose" in kwargs:
+            self.verbose = kwargs["verbose"] 
 
         if isinstance(audio, str):
-            # This simplified transcriber expects a pre-loaded waveform.
-            # Scraibe's get_audio_file().waveform should handle path loading.
             raise NotImplementedError("This transcribe method expects a waveform Tensor, not a path. "
                                       "Ensure Scraibe passes audio_processor.waveform.")
         elif isinstance(audio, np.ndarray):
@@ -318,27 +322,23 @@ class OpenAIWhisperIPEXLLMTranscriber(Transcriber):
         elif not isinstance(audio, torch.Tensor):
             raise TypeError(f"Expected audio to be str, Tensor, or ndarray, but got {type(audio)}")
 
-        # Ensure audio is a 1D float32 tensor for the processor
         if audio.ndim > 1:
-            audio = audio.squeeze() # Remove batch dim if present, assuming (1, N)
+            audio = audio.squeeze() 
         if audio.ndim != 1:
             raise ValueError(f"Audio waveform must be 1D, but got {audio.ndim} dimensions.")
         if audio.dtype != torch.float32:
             audio = audio.to(torch.float32)
 
-        # 1. Preprocess audio to input features
         try:
-            # Processor expects numpy array or list of floats for raw audio.
             input_features = self.processor(
-                audio.cpu().numpy(), # Convert to numpy for processor
-                sampling_rate=16000, # Whisper standard
+                audio.cpu().numpy(),
+                sampling_rate=16000, 
                 return_tensors="pt"
             ).input_features
         except Exception as e:
             warnings.warn(f"Error during processor feature extraction: {e}", RuntimeWarning)
             raise
 
-        # Move input features to the same device and dtype as the model expects
         try:
             model_first_param_dtype = next(self.model.parameters()).dtype
             if input_features.device != self.target_device:
@@ -350,48 +350,64 @@ class OpenAIWhisperIPEXLLMTranscriber(Transcriber):
                 input_features = input_features.to(model_first_param_dtype)
         except Exception as e:
             warnings.warn(f"Could not move/cast input_features to target device/dtype: {e}", RuntimeWarning)
-            # Proceeding, but there might be issues.
 
-        # 2. Get forced_decoder_ids for language and task
         language = kwargs.get("language", "en")
         task = kwargs.get("task", "transcribe")
         
-        generate_options = self._get_transcribe_kwargs(**kwargs) # Get generate-specific kwargs
+        generate_options = self._get_transcribe_kwargs(**kwargs) 
 
+        processed_forced_decoder_ids = None
         try:
-            # Note: Some WhisperProcessor versions might not have language='ja' if model is not multilingual supporting Japanese.
-            # It's safer to only set language if model is multilingual and lang is supported.
-            # However, get_decoder_prompt_ids should handle this by defaulting or raising error.
-            forced_decoder_ids = self.processor.get_decoder_prompt_ids(language=language, task=task)
+            processed_forced_decoder_ids = self.processor.get_decoder_prompt_ids(language=language, task=task)
         except Exception as e:
             warnings.warn(f"Could not get forced_decoder_ids for language='{language}', task='{task}': {e}. "
                           "Proceeding without them. This may affect multilingual models or task accuracy.", UserWarning)
-            forced_decoder_ids = None
         
         if self.verbose:
             print(f"Transcribing with: language='{language}', task='{task}', "
                   f"model_device='{self.model.device}', input_features_device='{input_features.device}', "
                   f"input_features_dtype='{input_features.dtype}'")
-            if forced_decoder_ids:
-                 print(f"Using forced_decoder_ids: {self.processor.tokenizer.convert_ids_to_tokens(forced_decoder_ids[0][1:-1]) if forced_decoder_ids and len(forced_decoder_ids[0]) > 2 else 'start/end tokens'}")
+            if processed_forced_decoder_ids:
+                 display_ids = processed_forced_decoder_ids[0] if isinstance(processed_forced_decoder_ids, list) and processed_forced_decoder_ids else processed_forced_decoder_ids
+                 # Ensure display_ids is a flat list or tensor of IDs for convert_ids_to_tokens
+                 if isinstance(display_ids, torch.Tensor) and display_ids.ndim > 1: display_ids = display_ids.squeeze()
+                 if isinstance(display_ids, list) and display_ids and isinstance(display_ids[0], list): display_ids = display_ids[0]
+
+                 # Attempt to decode only the relevant part of prompt, typically after SOT token
+                 try:
+                     sot_token_id = self.processor.tokenizer.sot_token_id
+                     relevant_ids = [t for t in display_ids if t != sot_token_id and t < self.processor.tokenizer.vocab_size] # Exclude special tokens like EOT for display
+                     # Only decode if there are actual content tokens
+                     if relevant_ids:
+                         decoded_prompt_tokens = self.processor.tokenizer.convert_ids_to_tokens(relevant_ids)
+                         print(f"Using forced_decoder_prompt (language/task tokens): {decoded_prompt_tokens}")
+                     else:
+                         print(f"Using forced_decoder_ids: (special tokens like start-of-transcript, language, task)")
+                 except Exception:
+                     print(f"Using forced_decoder_ids: (unable to decode for display)")
 
 
-        # 3. Generate token IDs
         transcription_text = ""
+        original_config_forced_ids = getattr(self.model.config, "forced_decoder_ids", None) # Store original
+
         with torch.no_grad():
             try:
-                # Common generate kwargs: max_length, num_beams, temperature, etc.
-                # Add use_cache=True as seen in benchmark for potential speedup.
                 generate_options.setdefault('use_cache', True)
-                if forced_decoder_ids:
-                    generate_options['forced_decoder_ids'] = forced_decoder_ids
+                
+                # Temporarily set model's internal config for forced_decoder_ids to None
+                # to prevent conflict if we are explicitly passing it to generate().
+                self.model.config.forced_decoder_ids = None 
+                
+                if processed_forced_decoder_ids:
+                    generate_options['forced_decoder_ids'] = processed_forced_decoder_ids
+                else: # Ensure it's not in options if we couldn't get them
+                    generate_options.pop('forced_decoder_ids', None)
                 
                 predicted_ids = self.model.generate(input_features, **generate_options)
 
                 if self.target_device.type == "xpu":
                     torch.xpu.synchronize()
 
-                # 4. Decode token IDs to text
                 transcription_text = self.processor.batch_decode(predicted_ids, skip_special_tokens=True)[0]
                 
                 if self.verbose:
@@ -401,25 +417,21 @@ class OpenAIWhisperIPEXLLMTranscriber(Transcriber):
 
             except Exception as e:
                 warnings.warn(f"Error during model.generate() or decoding: {e}", RuntimeWarning)
-                # If you want to see the full traceback for debugging:
-                # import traceback
-                # traceback.print_exc()
-                # For now, we'll return an empty transcription on error.
+                # Restore config even on exception
+                setattr(self.model.config, "forced_decoder_ids", original_config_forced_ids)
                 return {"text": "", "segments": [], "language": language}
+            finally:
+                # Restore original config value for forced_decoder_ids
+                setattr(self.model.config, "forced_decoder_ids", original_config_forced_ids)
 
-
-        # Basic segment creation (full text as one segment)
-        # TODO: Implement more detailed segmentation if required, e.g., by analyzing predicted_ids for timestamps
-        # or using other features of the generation output if available.
         segments = []
         if transcription_text:
-            # This is a placeholder for segments. Duration is unknown here.
             segments.append({"start": 0.0, "end": 0.0, "text": transcription_text.strip()})
 
         return {
             "text": transcription_text.strip(),
             "segments": segments,
-            "language": language # Return the language used for transcription
+            "language": language
         }
 
     @staticmethod
