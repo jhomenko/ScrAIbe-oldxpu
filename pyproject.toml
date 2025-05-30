@@ -4,7 +4,7 @@ build-backend = "poetry_dynamic_versioning.backend"
 
 [tool.poetry]
 name = "scraibe"
-version = "0.0.0"
+version = "0.0.0" # Will be set by poetry-dynamic-versioning
 description = "Transcription tool for audio files based on Whisper and Pyannote"
 authors = ["Schmieder, Jacob <jacob.schmieder@dbfz.de>"]
 license = "GPL-3.0-or-later"
@@ -13,33 +13,55 @@ repository = "https://github.com/JSchmie/ScAIbe"
 documentation = "https://jschmie.github.io/ScrAIbe/"
 keywords = ["transcription", "audio", "whisper", "pyannote", "speech-to-text", "speech-recognition"]
 classifiers = [
-                'Development Status :: 4 - Beta',
-                'Intended Audience :: Developers',
-                'License :: OSI Approved :: GNU General Public License v3 (GPLv3)',
-                'Programming Language :: Python :: 3.8',
-                'Programming Language :: Python :: 3.9',
-                'Programming Language :: Python :: 3.10',
-                'Programming Language :: Python :: 3.11',
-                'Environment :: GPU :: NVIDIA CUDA :: 12 :: 12.1',
-                'Topic :: Scientific/Engineering :: Artificial Intelligence'
-                ]
+    'Development Status :: 4 - Beta',
+    'Intended Audience :: Developers',
+    'License :: OSI Approved :: GNU General Public License v3 (GPLv3)',
+    'Programming Language :: Python :: 3.9',
+    'Programming Language :: Python :: 3.10',
+    'Programming Language :: Python :: 3.11', # Python 3.11 is used in the ipex-llm quickstart
+    'Environment :: GPU :: NVIDIA CUDA :: 12 :: 12.1', # Retained if you also support CUDA
+    'Topic :: Scientific/Engineering :: Artificial Intelligence'
+]
 packages = [{include = "scraibe"}]
 exclude =[
-        "__pycache__",
-        "*.pyc",
-        "test"
-        ]
+    "__pycache__",
+    "*.pyc",
+    "test"
+]
+
 [tool.poetry.dependencies]
-python = "^3.9"
+python = "^3.11" # ipex-llm quickstart uses Python 3.11, consider aligning if possible
+
+# Core application dependencies
 tqdm = "^4.66.5"
-numpy = "^1.26.4"
-openai-whisper = ">=20231117,<20240931"
+numpy = "^1.26.4" # ipex-llm 2.3.0rc1 used 1.26.4
+openai-whisper = ">=20231117,<20240931" # Ensure compatibility with transformers 4.37.0 if pinned
 faster-whisper = "^1.0.3"
-"pyannote.audio" = ">=3.1.0"
-torch = "==2.7.0"
-torchaudio = "==2.7.0"
-intel-extension-for-pytorch = "==2.7.10+xpu"
-oneccl_bind_pt = "==2.7.0+xpu"
+"pyannote.audio" = ">=3.1.0" # Ensure compatibility with torch 2.6.x
+
+# --- PyTorch Stack for IPEX-LLM [xpu_2.6] ---
+# Targeting PyTorch 2.6.x and IPEX 2.6.10+xpu as per Intel Dockerfile example for ipex-llm[xpu_2.6]
+# The exact PyTorch XPU wheel string (e.g., "==2.6.0+xpu" or similar with build hash)
+# needs to be confirmed from Intel's wheel indexes for compatibility with IPEX 2.6.10+xpu.
+# For now, using a general 2.6.x specifier; ipex-llm[xpu_2.6] install will guide this.
+torch = ">=2.6.0,<2.7.0" # General specifier, will be refined by ipex-llm[xpu_2.6] install
+torchaudio = ">=2.6.0,<2.7.0" # Match torch XPU version
+intel-extension-for-pytorch = "==2.6.10+xpu"
+# oneccl_bind_pt = "==2.6.0+xpu" # For distributed; add if explicitly needed by your setup or ipex-llm[xpu_2.6]
+
+# --- IPEX-LLM ---
+# Using the [xpu_2.6] tag as per Intel's Linux Quickstart and Dockerfile.
+# This will pull its specific dependencies, including the correct torch and ipex if not pinned precisely above,
+# or it will verify against the pinned versions.
+ipex-llm = { version = ">=2.3.0rc1", extras = ["xpu_2.6"] } # Using rc1 as a recent pre-release
+
+# --- Dependencies that ipex-llm (e.g., 2.3.0rc1 with [xpu_2.6]) might install/require ---
+# These versions will likely be enforced by ipex-llm[xpu_2.6].
+# Pinning them can help ensure consistency if ipex-llm's spec is loose.
+transformers = "==4.37.0" # This was pulled by a previous ipex-llm install attempt
+tokenizers = "==0.15.2"   # This was pulled by a previous ipex-llm install attempt
+accelerate = "==0.23.0"   # This was pulled by a previous ipex-llm install attempt
+# setuptools = "<70.0.0" # ipex-llm also pinned this, poetry handles setuptools differently
 
 [tool.poetry.group.dev.dependencies]
 pytest = "^8.1.1"
@@ -68,17 +90,16 @@ mdit-py-plugins = "^0.4.1"
 [tool.poetry.scripts]
 scraibe = "scraibe.cli:cli"
 
-[tool.poetry.extras]
-app = ["scraibe-webui"]
-
-[tool.ruff.lint.extend-per-file-ignores]
-"__init__.py" = ["E402","F403",'F401']
-"scraibe/misc.py" = ["E722"]
-
 [[source]]
 name = "pytorch-xpu"
 url = "https://download.pytorch.org/whl/xpu"
+priority = "explicit"
 
 [[source]]
 name = "intel"
 url = "https://pytorch-extension.intel.com/release-whl/stable/xpu/us/"
+priority = "explicit"
+
+[tool.ruff.lint.extend-per-file-ignores]
+"__init__.py" = ["E402","F403",'F401']
+"scraibe/misc.py" = ["E722"]
