@@ -81,7 +81,6 @@ def cli():
                         help="Language spoken in the audio. Specify None to perform language detection.")
     parser.add_argument("--num-speakers", type=int, default=None, # Default to None, let autotranscribe handle default if not set
                         help="Number of speakers in the audio (used by autotranscribe).")
-    
     parser.add_argument("--low-bit", type=str, default="bf16",
                         help="Quantization mode for IPEX-LLM (e.g., 'bf16', 'int4', 'sym_int4', 'fp16'). "
                              "Specifics depend on transcriber implementation.")
@@ -93,12 +92,10 @@ def cli():
 
     # --- Prepare arguments for Scraibe class constructor ---
     class_kwargs = {}
+    class_kwargs['low_bit'] = arg_dict.pop("low_bit")
     class_kwargs['whisper_model'] = arg_dict.pop("whisper_model_name")
     class_kwargs['whisper_type'] = arg_dict.pop("whisper_type")
     class_kwargs['target_device'] = arg_dict.pop("inference_device")
-    # Add low_bit to class_kwargs so it can be passed to Scraibe's __init__
-    # and then down to the transcriber loading
-    class_kwargs['low_bit'] = arg_dict.pop("low_bit")
 
     if arg_dict.get("diarization_directory") is not None:
         class_kwargs['dia_model'] = arg_dict.pop("diarization_directory")
@@ -142,6 +139,7 @@ def cli():
         language_arg = arg_dict.pop("language")
         verbose_arg = arg_dict.pop("verbose_output")
         num_speakers_arg = arg_dict.pop("num_speakers")
+        num_beams_arg = arg_dict.pop("num_beams")
 
         for audio_file_path in audio_files_to_process:
             base_filename = os.path.splitext(os.path.basename(audio_file_path))[0]
@@ -228,6 +226,7 @@ def cli():
                     task=task_to_perform,
                     language=language_arg,
                     verbose=verbose_arg
+                    num_beams=num_beams_arg
                 )
                 
                 save_path = f"{output_path_base}.txt" # Default to .txt
