@@ -466,26 +466,33 @@ class OpenAIWhisperIPEXLLMTranscriber(Transcriber):
                     previous_tokens_for_prompt = previous_tokens_for_prompt[-max_prompt_len:]
 
                 # Get base prompt (SOT, lang, task)
+                # Get base prompt (SOT, lang, task)
+                initial_prompt_special_tokens = [] # Default to an empty list
                 try:
-                    # If language was None, the first iteration will use language=None here,
-                    # subsequent iterations will use the detected_lang_from_first_segment
+                    # ... (lang_for_prompt determination as before) ...
                     lang_for_prompt = current_language
                     if current_language is None and all_segments: # If lang was detected from first segment
-                        lang_for_prompt = all_segments[0].get("language", "en")
+                        lang_for_prompt = all_segments[0].get("language", "en") # or "language_from_model_output"
 
-                    current_decoder_prompt_list = self.processor.get_decoder_prompt_ids(
+                    current_decoder_prompt_list_of_lists = self.processor.get_decoder_prompt_ids(
                         language=lang_for_prompt, 
                         task=task, 
-                        no_timestamps=True # Typically for prompting, timestamps are not part of the text prompt
+                        no_timestamps=True 
                     )
-                    # get_decoder_prompt_ids returns list of lists, e.g. [[50257, 50296, 50359, 50363]]
-                    # We need the inner list.
-                    current_prompt_tokens = current_decoder_prompt_list[0] if current_decoder_prompt_list else []
+                    # Ensure current_prompt_tokens is a new list to which we can extend
+                    if current_decoder_prompt_list_of_lists and current_decoder_prompt_list_of_lists[0] is not None:
+                        initial_prompt_special_tokens = list(current_decoder_prompt_list_of_lists[0]) # Convert to list
+                    else:
+                        initial_prompt_special_tokens = [] # Ensure it's a list
                 except Exception as e:
-                    warnings.warn(f"Error getting decoder prompt ids for lang {current_language}, task {task}: {e}. Using minimal prompt.", UserWarning)
-                    current_prompt_tokens = [self.processor.tokenizer.sot_token_id] # Minimal SOT
+                    warnings.warn(f"Error getting decoder prompt ids for lang {current_language}, task {task}: {e}. Using minimal SOT prompt.", UserWarning)
+                    initial_prompt_special_tokens = [self.processor.tokenizer.sot_token_id] # This is already a list
 
+                # Start current_prompt_tokens as a new list based on special tokens, then extend
+                current_prompt_tokens = list(initial_prompt_special_tokens) # Ensure it's a mutable list copy
+                
                 # Combine with previous text tokens if conditioning
+                # previous_tokens_for_prompt should already be a list from its preparation
                 current_prompt_tokens.extend(previous_tokens_for_prompt)
                 
                 # Ensure prompt is not too long for the model
