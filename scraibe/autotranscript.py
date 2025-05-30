@@ -91,23 +91,25 @@ class Scraibe:
 
         # --- Initialize Transcriber ---
         transcriber_load_kwargs = component_kwargs.copy()
-        transcriber_load_kwargs['device_option'] = self.target_device # Ensure correct param name for load_transcriber
-        if download_root:
+        #transcriber_load_kwargs['device_option'] = self.target_device # Ensure correct param name for load_transcriber
+        if download_root: # download_root is an explicit param of Scraibe.__init__
             transcriber_load_kwargs['download_root'] = download_root
-        if use_auth_token and 'use_auth_token' not in transcriber_load_kwargs : # Pass if not already there under a different alias
-             transcriber_load_kwargs['use_auth_token'] = use_auth_token # Assuming load_transcriber takes this
+        if use_auth_token: # use_auth_token is an explicit param of Scraibe.__init__
+             transcriber_load_kwargs['use_auth_token'] = use_auth_token
 
         if isinstance(whisper_model, Transcriber):
             self.transcriber = whisper_model
             if self.verbose: print(f"Using provided Transcriber instance: {self.transcriber}")
-        else: # Handles string name or None (which defaults to "medium" effectively)
+        else: 
             effective_whisper_model_name = whisper_model if whisper_model is not None else "medium"
             if self.verbose: 
+                # The device printed here is self.target_device, which will be passed to load_transcriber's `device` param
                 print(f"Loading Transcriber: model='{effective_whisper_model_name}', type='{whisper_type}', device='{self.target_device}'")
             self.transcriber = load_transcriber(
                 model_name=effective_whisper_model_name,
                 whisper_type=whisper_type,
-                **transcriber_load_kwargs
+                device=self.target_device, # << PASS self.target_device to the 'device' PARAMETER of load_transcriber
+                **transcriber_load_kwargs  # These kwargs should no longer contain 'device_option'
             )
 
         # --- Initialize Diariser ---
