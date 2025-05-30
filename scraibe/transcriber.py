@@ -536,7 +536,7 @@ class OpenAIWhisperIPEXLLMTranscriber(Transcriber):
                 # We need to get content tokens from segment_tokens_generated_part
                 content_tokens_for_prompt = [
                     tok for tok in segment_tokens_generated_part 
-                    if tok < self.processor.tokenizer.eot_token_id # Basic filter for content
+                    if tok < self.processor.tokenizer.eos_token_id # Basic filter for content
                 ]
                 all_tokens.extend(content_tokens_for_prompt)
 
