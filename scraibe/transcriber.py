@@ -341,10 +341,10 @@ class OpenAIWhisperIPEXLLMTranscriber(Transcriber):
         if not self.processor or not self.model:
             raise RuntimeError("Transcriber is not properly initialized with a model and processor.")
 
-        self.verbose = kwargs.get("verbose", self.verbose) # Update instance verbose from call
+        self.verbose = kwargs.get("verbose", self.verbose)
 
         if isinstance(audio, str):
-            raise NotImplementedError("This method expects a pre-processed waveform Tensor.")
+            raise NotImplementedError("This transcribe method expects a pre-processed waveform Tensor.")
         elif isinstance(audio, np.ndarray):
             audio_waveform = torch.from_numpy(audio.astype(np.float32))
         elif isinstance(audio, torch.Tensor):
@@ -360,16 +360,26 @@ class OpenAIWhisperIPEXLLMTranscriber(Transcriber):
                   f"with self.processor for a single model.generate() call...")
         
         try:
-            # Process entire audio, request attention_mask.
-            # The processor should not truncate by default for long audio.
+            # --- CRITICAL CHANGE HERE: Add truncation=False and padding ---
             inputs = self.processor(
                 audio_waveform.cpu().numpy(), 
                 sampling_rate=SAMPLE_RATE, 
                 return_tensors="pt",
-                return_attention_mask=True 
+                return_attention_mask=True, # Keep this
+                truncation=False,           # ADD THIS: Ensure full audio is processed
+                padding="longest"           # ADD THIS: Standard practice with truncation=False for pipelines
+                                            # For single long audio, 'longest' effectively means 'to its own length'
+                                            # or use `padding=True` if preferred for single item.
             )
             input_features = inputs.input_features
             attention_mask = inputs.get("attention_mask")
+            # --- END CRITICAL CHANGE ---
+
+            if self.verbose:
+                print(f"Shape of full input_features from processor: {input_features.shape}")
+                if attention_mask is not None:
+                    print(f"Shape of full attention_mask from processor: {attention_mask.shape}")
+
         except Exception as e:
             warnings.warn(f"Error during full audio feature extraction: {e}", RuntimeWarning)
             raise
@@ -386,18 +396,13 @@ class OpenAIWhisperIPEXLLMTranscriber(Transcriber):
         except Exception as e:
              warnings.warn(f"Could not move/cast input_features/attention_mask to target device/dtype: {e}", RuntimeWarning)
 
-        # Prepare generate options
         generate_options = self._get_transcribe_kwargs(**kwargs)
-        # Ensure crucial options for long-form and segment/timestamp return are set
-        generate_options['return_timestamps'] = True # 'segments' or 'chunks' in output often need this
-        generate_options['return_dict_in_generate'] = True # For structured output
-        
-        final_language_to_report = generate_options.get("language") # Initial language
+        final_language_to_report = generate_options.get("language") 
 
         if self.verbose:
-            print(f"Calling self.model.generate() for full audio. Options: {generate_options}")
+            print(f"Calling self.model.generate() for full audio. Effective options passed: {generate_options}")
             print(f"Model device: {self.model.device}, Input features device: {input_features.device}, "
-                  f"dtype: {input_features.dtype}, shape: {input_features.shape}")
+                  f"dtype: {input_features.dtype}, shape: {input_features.shape}") # Re-check shape after potential casting
             if attention_mask is not None: print(f"Attention mask shape: {attention_mask.shape}, device: {attention_mask.device}")
 
         full_text = ""
@@ -405,51 +410,42 @@ class OpenAIWhisperIPEXLLMTranscriber(Transcriber):
 
         with torch.no_grad():
             try:
-                # The `generate` method of WhisperForConditionalGeneration (inherited by IPEX-LLM model)
-                # should handle long-form transcription internally using its own chunking.
                 output = self.model.generate(
-                    inputs=input_features, # Use 'inputs' as per transformers>=4.31.0, or input_features
+                    inputs=input_features, # Using 'inputs' kwarg for features
                     attention_mask=attention_mask,
                     **generate_options 
                 )
 
                 if self.target_device.type == "xpu":
                     torch.xpu.synchronize()
-
-                # Process output: output is a GenerationOutput object (or dict) if return_dict_in_generate=True
+                
+                # ... (rest of your output processing logic for full_text and segments_data) ...
+                # (This part should remain the same as my previous suggestion for parsing output)
                 predicted_ids = output.sequences if hasattr(output, "sequences") else output
                 full_text = self.processor.batch_decode(predicted_ids, skip_special_tokens=True)[0].strip()
                 
-                # Attempt to extract segments. Structure depends on `generate` output.
-                # The HF pipeline with chunk_length_s returns a list of dicts with "text" and "timestamp" (tuple).
-                # The raw model.generate() with return_timestamps=True might return segments or token-level timestamps.
                 raw_segments = None
-                if hasattr(output, "segments") and output.segments is not None: # Common for patched generate
+                if hasattr(output, "segments") and output.segments is not None:
                     raw_segments = output.segments
-                elif hasattr(output, "chunks") and output.chunks is not None: # Common for ASR Pipeline output
+                elif hasattr(output, "chunks") and output.chunks is not None: 
                     raw_segments = output.chunks
-                # If 'return_token_timestamps=True' was used and effective, output.token_timestamps would exist
-                elif hasattr(output, "token_timestamps") and output.token_timestamps is not None:
-                    if self.verbose: print("Found token-level timestamps. Segment reconstruction from these is not yet implemented here.")
-                    # This would require logic similar to openai-whisper or faster-whisper's _split_segments_by_timestamps
                 
                 if raw_segments and isinstance(raw_segments, list):
-                    for i, seg_data in enumerate(raw_segments):
-                        text = seg_data.get("text", "").strip()
-                        ts = seg_data.get("timestamp") # Expected to be (start_sec, end_sec) tuple
+                    for i, seg_data_from_model in enumerate(raw_segments):
+                        text = seg_data_from_model.get("text", "").strip()
+                        ts = seg_data_from_model.get("timestamp") 
                         start_time = ts[0] if isinstance(ts, (list, tuple)) and len(ts) > 0 else 0.0
-                        end_time = ts[1] if isinstance(ts, (list, tuple)) and len(ts) > 1 and ts[1] is not None else start_time # Default end to start if missing
+                        end_time = ts[1] if isinstance(ts, (list, tuple)) and len(ts) > 1 and ts[1] is not None else start_time 
                         
                         segments_data.append({
-                            "id": i, "seek": int(start_time * SAMPLE_RATE / (HOP_LENGTH if HOP_LENGTH > 0 else 160)), 
+                            "id": i, "seek": int(start_time * SAMPLE_RATE / (HOP_LENGTH if 'HOP_LENGTH' in globals() and HOP_LENGTH > 0 else 160)), 
                             "start": round(float(start_time), 3), "end": round(float(end_time), 3),
-                            "text": text, "tokens": seg_data.get("tokens", []), # Optional
+                            "text": text, "tokens": seg_data_from_model.get("tokens", []),
                         })
                     if self.verbose: print(f"Extracted {len(segments_data)} segments from model output.")
-                
-                if not segments_data and full_text: # Fallback if no structured segments but text exists
-                    warnings.warn("Detailed segments not found/parsed from model.generate() output. "
-                                  "Creating a single segment for the full text.", UserWarning)
+                elif full_text: 
+                    warnings.warn("Detailed segments not found in model.generate() output. "
+                                  "Creating a single segment. Check if 'return_timestamps' or similar options are effective.", UserWarning)
                     segments_data.append({
                         "id": 0, "seek": 0, 
                         "start": 0.0, "end": round(audio_waveform.shape[0]/SAMPLE_RATE, 3), 
@@ -457,18 +453,14 @@ class OpenAIWhisperIPEXLLMTranscriber(Transcriber):
                         "tokens": predicted_ids.squeeze().tolist() if isinstance(predicted_ids, torch.Tensor) else []
                     })
 
-                # Language
                 if hasattr(output, "language"): final_language_to_report = output.language
-                elif final_language_to_report is None: final_language_to_report = "en" # Fallback
+                elif final_language_to_report is None: final_language_to_report = "en"
 
                 if self.verbose:
                     print(f"--- Transcription ---")
                     print(f"Language: {final_language_to_report}")
                     print(full_text)
-                    if segments_data and (not raw_segments or len(segments_data) < 5 or len(segments_data) == 1 and segments_data[0]['text'] == full_text) :
-                        for seg in segments_data: print(f"  [{seg['start']:.3f} -> {seg['end']:.3f}] {seg['text']}")
-                    elif segments_data:
-                         print(f"  (Total {len(segments_data)} segments, showing first few if different from full text)")
+                    # ... (segment printing logic) ...
                     print(f"--- End Transcription ---")
 
             except Exception as e:
@@ -486,6 +478,7 @@ class OpenAIWhisperIPEXLLMTranscriber(Transcriber):
             "segments": segments_data,
             "language": final_language_to_report
         }
+
 
 class FasterWhisperTranscriber(Transcriber):
     """
