@@ -85,13 +85,15 @@ mdit-py-plugins = "^0.4.1"
 scraibe = "scraibe.cli:cli"
 
 # Source definitions for Poetry
-[[source]]
+[[tool.poetry.source]]
 name = "pytorch-xpu"
-url = "https://download.pytorch.org/whl/xpu"
+url = "https://download.pytorch.org/whl/xpu/"
+priority = "explicit"
 
-[[source]]
+[[stool.poetry.source]]
 name = "intel"
 url = "https://pytorch-extension.intel.com/release-whl/stable/xpu/us/"
+priority = "explicit"
 
 # PyPI is typically used by default by Poetry if a package isn't found in other defined sources.
 # You can add it explicitly if needed, e.g.:
