@@ -444,18 +444,31 @@ class OpenAIWhisperIPEXLLMTranscriber(Transcriber):
                 for temp_idx, temp in enumerate(temperatures):
                     current_generate_args = generate_args_base.copy()
                     current_generate_args['temperature'] = temp
-
-                    if temp == 0.0 and not current_generate_args.get('do_sample', False): # Greedy
-                        current_generate_args.pop('temperature', None) # Transformers might warn if temp=0 and do_sample=False
+                    
+                    # Adjust beam search / sampling based on temperature
+                    if temp == 0.0: # For temperature 0.0
                         current_generate_args['do_sample'] = False
-                        current_generate_args.setdefault('num_beams', 1) # Ensure greedy
-                    elif temp > 0: # Sampling
+                        current_generate_args['num_beams'] = 1 # FORCE GREEDY DECODING
+                        # Remove sampling-specific args that might conflict with greedy
+                        current_generate_args.pop('top_k', None)
+                        current_generate_args.pop('top_p', None)
+                        current_generate_args.pop('typical_p', None)
+                        current_generate_args.pop('epsilon_cutoff', None)
+                        current_generate_args.pop('eta_cutoff', None)
+                        # To potentially silence the UserWarning about temperature=0.0 and do_sample=False:
+                        # If num_beams is 1 and do_sample is False, temperature isn't strictly used by generate for sampling logic
+                        current_generate_args.pop('temperature', None) # Remove temperature for pure greedy
+                    elif temp > 0: # For sampling temperatures
                         current_generate_args['do_sample'] = True
-                        current_generate_args.pop("num_beams", None)
-                    else: # temp == 0.0 and num_beams > 1 (Beam search)
-                         current_generate_args['do_sample'] = False
-                         current_generate_args.setdefault('num_beams', generate_args_base.get('num_beams',5))
-
+                        # Ensure num_beams is not set, or set to 1, if we want pure temperature sampling
+                        current_generate_args.pop("num_beams", None) 
+                        # Ensure top_k/top_p are set if that's the desired sampling strategy with temperature
+                        current_generate_args.setdefault("top_k", 0) # Example: often 0 or 50 for top-k sampling
+                        current_generate_args.setdefault("top_p", 1.0) # Example: often 1.0 or 0.9 for top-p sampling
+                    # If temp == 0.0 and a user *explicitly* passed num_beams > 1 in kwargs, 
+                    # _get_transcribe_kwargs would have set it in generate_args_base.
+                    # The logic above now forces num_beams=1 for temp=0.0 for this test.
+                    # If you want to allow user-specified beam search for temp=0.0, this logic would differ.
 
                     if self.verbose and len(temperatures) > 1:
                         pbar.set_description_str(f"Transcribing (seek {seek_samples/SAMPLE_RATE:.1f}s, temp {temp:.1f})")
