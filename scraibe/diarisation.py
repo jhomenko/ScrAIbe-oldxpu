@@ -185,107 +185,142 @@ class Diariser:
 
     @classmethod
     def load_model(cls,
-                   model: str = PYANNOTE_DEFAULT_CONFIG,
+                   model: Optional[str] = PYANNOTE_DEFAULT_CONFIG, # Allow model to be explicitly None
                    use_auth_token: str = None,
                    cache_token: bool = False,
                    cache_dir: Union[Path, str] = PYANNOTE_DEFAULT_PATH,
                    hparams_file: Union[str, Path] = None,
                    device: str = SCRAIBE_TORCH_DEVICE,
-                   ) -> 'Diariser':
+                   ) -> 'Diariser': # Type hint for returning an instance of the class
         """
         Loads a pretrained model from pyannote.audio, 
         either from a local cache or some online repository.
 
         Args:
-            model: Path or identifier for the pyannote model.
-                default: '/home/[user]/.cache/torch/models/pyannote/config.yaml'
-                or one of 'jaikinator/scraibe', 'pyannote/speaker-diarization-3.1'
-            token: Optional HUGGINGFACE_TOKEN for authenticated access.
+            model: Path to a local config.yaml, a Hugging Face model ID (e.g., 'pyannote/speaker-diarization-3.1'),
+                   a special tuple for fallback, or None to use PYANNOTE_DEFAULT_CONFIG.
+            use_auth_token: Optional HUGGINGFACE_TOKEN for authenticated access. (Note: docstring said 'token')
             cache_token: Whether to cache the token locally for future use.
             cache_dir: Directory for caching models.
             hparams_file: Path to a YAML file containing hyperparameters.
             device: Device to load the model on.
-            args: Additional arguments only to avoid errors.
-            kwargs: Additional keyword arguments only to avoid errors.
-
+        
         Returns:
-            Pipeline: A pyannote.audio Pipeline object, encapsulating the loaded model.
+            Diariser: An instance of the Diariser class, encapsulating the loaded pyannote.audio Pipeline.
         """
-        if isinstance(model, str) and os.path.exists(model):
-            # check if model can be found locally nearby the config file
-            with open(model, 'r') as file:
+        
+        # If 'model' is explicitly passed as None (e.g., from Scraibe if no diarization model is specified),
+        # then use the default configuration path/ID defined in this class.
+        current_model_identifier = model
+        if current_model_identifier is None:
+            current_model_identifier = PYANNOTE_DEFAULT_CONFIG
+            if current_model_identifier is None: # Should not happen if PYANNOTE_DEFAULT_CONFIG is properly set
+                raise ValueError("Diariser model identifier is None and PYANNOTE_DEFAULT_CONFIG is also not set.")
+
+        # --- Your original logic for handling local paths and tuples ---
+        # This section might modify 'current_model_identifier' or 'use_auth_token'
+        
+        if isinstance(current_model_identifier, str) and os.path.exists(current_model_identifier):
+            # This block handles the case where 'current_model_identifier' is a path to a local config.yaml
+            # It will attempt to find the associated .bin file and may modify the config.yaml in place.
+            # 'current_model_identifier' will remain the path to the (potentially modified) config.yaml.
+            
+            # Your existing local path handling code:
+            with open(current_model_identifier, 'r') as file:
                 config = yaml.safe_load(file)
 
-            path_to_model = config['pipeline']['params']['segmentation']
+            path_to_model_bin = config['pipeline']['params']['segmentation']
 
-            if not os.path.exists(path_to_model):
-                warnings.warn(f"Model not found at {path_to_model}. "
+            if not os.path.exists(path_to_model_bin):
+                warnings.warn(f"Model binary not found at {path_to_model_bin} (specified in {current_model_identifier}). "
                               "Trying to find it nearby the config file.")
 
-                pwd = model.split("/")[:-1]
-                pwd = "/".join(pwd)
+                pwd = os.path.dirname(current_model_identifier) # Get directory of the config file
+                potential_path_to_model_bin = os.path.join(pwd, "pytorch_model.bin")
 
-                path_to_model = os.path.join(pwd, "pytorch_model.bin")
-
-                if not os.path.exists(path_to_model):
-                    warnings.warn(f"Model not found at {path_to_model}. \
-                        'Trying to find it nearby .bin files instead.")
-                    warnings.warn(
-                        'Searching for nearby files in a folder path is '
-                        'deprecated and will be removed in future versions.',
-                        category=DeprecationWarning)
-                    # list elementes with the ending .bin
-                    bin_files = [f for f in os.listdir(
-                        pwd) if f.endswith(".bin")]
+                if not os.path.exists(potential_path_to_model_bin):
+                    warnings.warn(f"Model binary also not found at {potential_path_to_model_bin}. "
+                                  "Trying to find any .bin file in the same directory.")
+                    bin_files = [f for f in os.listdir(pwd) if f.endswith(".bin")]
                     if len(bin_files) == 1:
-                        path_to_model = os.path.join(pwd, bin_files[0])
+                        potential_path_to_model_bin = os.path.join(pwd, bin_files[0])
+                        # Fall through to update config with potential_path_to_model_bin
+                    elif len(bin_files) > 1:
+                        warnings.warn(f"Found more than one .bin file in {pwd}. Cannot automatically select. "
+                                      "Please ensure the 'segmentation' path in your config.yaml is correct.")
+                        # Proceed with original path_to_model_bin from config, Pipeline.from_pretrained might handle or fail.
+                        potential_path_to_model_bin = None # Flag that we didn't find a unique alternative
                     else:
-                        warnings.warn("Found more than one .bin file. "
-                                      "or none. Please specify the path to the model "
-                                      "or setup a huggingface token.")
-                        raise FileNotFoundError
+                        warnings.warn(f"Found no .bin files in {pwd}. "
+                                      "Model loading will rely on the original 'segmentation' path in config or fail.")
+                        potential_path_to_model_bin = None # Flag that we didn't find an alternative
+                
+                if potential_path_to_model_bin and os.path.exists(potential_path_to_model_bin):
+                     warnings.warn(
+                        f"Found model binary at {potential_path_to_model_bin}. Overwriting 'segmentation' path in loaded config for {current_model_identifier}.")
+                     config['pipeline']['params']['segmentation'] = str(Path(potential_path_to_model_bin).resolve()) # Use absolute path
+                     try:
+                        with open(current_model_identifier, 'w') as file: # Attempt to update the config file
+                            yaml.dump(config, file)
+                        warnings.warn(f"Config file {current_model_identifier} updated with new model binary path.")
+                     except Exception as e:
+                        warnings.warn(f"Could not write updated config to {current_model_identifier}: {e}. Using in-memory modified config.")
+            # 'current_model_identifier' (the path to config.yaml) is used by Pipeline.from_pretrained
+            # which will read the (potentially modified in-memory or on-disk) 'segmentation' path.
 
-                warnings.warn(
-                    f"Found model at {path_to_model} overwriting config file.")
-
-                config['pipeline']['params']['segmentation'] = path_to_model
-
-                with open(model, 'w') as file:
-                    yaml.dump(config, file)
-        elif isinstance(model, tuple):
+        elif isinstance(current_model_identifier, tuple):
+            # Your existing tuple handling code (for trying two HF model IDs)
+            # This block should set 'current_model_identifier' to the chosen string ID
+            # and potentially update 'use_auth_token'.
             try:
-                _model = model[0]
-                HfApi().model_info(_model)
-                model = _model
-                use_auth_token = None
+                primary_model_id = current_model_identifier[0]
+                HfApi().model_info(primary_model_id) # Check existence
+                current_model_identifier = primary_model_id
+                # use_auth_token = None # If primary is public, token might not be needed for it
             except RepositoryNotFoundError:
-                print(f'{model[0]} not found on Huggingface, \
-                      trying {model[1]}')
-                _model = model[1]
-                HfApi().model_info(_model)
-                model = _model
-                if cache_token and use_auth_token is not None:
-                    cls._save_token(use_auth_token)
+                print(f"Primary model '{current_model_identifier[0]}' not found on Huggingface. Trying fallback '{current_model_identifier[1]}'.")
+                fallback_model_id = current_model_identifier[1]
+                try:
+                    HfApi().model_info(fallback_model_id) # Check existence of fallback
+                    current_model_identifier = fallback_model_id
+                    # Token logic for fallback from your original code:
+                    if use_auth_token is None: # If no token was provided initially for the fallback
+                        try:
+                            use_auth_token = cls._get_token() # Try to get a saved token
+                        except ValueError: # No token found/saved
+                            warnings.warn(f"No Hugging Face token provided or found for fallback model {fallback_model_id}. Public access will be attempted.")
+                            use_auth_token = None # Ensure it's None for Pipeline.from_pretrained
+                    # If use_auth_token was already provided, it will be used for the fallback.
+                    if cache_token and use_auth_token is not None: # Cache if specified and token exists
+                        cls._save_token(use_auth_token)
+                except RepositoryNotFoundError:
+                    raise FileNotFoundError(f"Neither primary '{current_model_identifier[0]}' nor fallback '{fallback_model_id}' model found on Huggingface.")
+            except Exception as e:
+                 raise ValueError(f"Error validating model tuple {current_model_identifier} with Hugging Face Hub: {e}")
+        
+        # If current_model_identifier is a string (original, from default, or from tuple logic)
+        # and not a local existing path handled above, it's assumed to be a Hugging Face ID
+        # or other identifier that Pipeline.from_pretrained can handle.
+        # The original 'else: raise FileNotFoundError' is removed here to allow HF IDs to pass through.
+        # Pipeline.from_pretrained will raise its own error if the ID is invalid.
+        if not isinstance(current_model_identifier, str):
+             raise TypeError(f"Processed model identifier is not a string: {current_model_identifier} (type {type(current_model_identifier)}). Expected path or Hugging Face ID.")
 
-                if use_auth_token is None:
-                    use_auth_token = cls._get_token()
-        else:
-            raise FileNotFoundError(
-                f'No local model or directory found at {model}.')
 
-        _model = Pipeline.from_pretrained(model,
-                                          use_auth_token=use_auth_token,
-                                          cache_dir=cache_dir,
-                                          hparams_file=hparams_file,)
-        if _model is None:
-            raise ValueError('Unable to load model either from local cache'
-                             'or from huggingface.co models. Please check your token'
-                             'or your local model path')
+        # Call Pipeline.from_pretrained with the resolved current_model_identifier
+        pipeline_instance = Pipeline.from_pretrained(
+            current_model_identifier,
+            use_auth_token=use_auth_token, # This might have been updated by the tuple logic
+            cache_dir=cache_dir,
+            hparams_file=hparams_file,
+        )
+        
+        if pipeline_instance is None: # Should typically raise error in from_pretrained, but as a safeguard
+            raise ValueError(f"Unable to load model for '{current_model_identifier}'. "
+                             "Please check your model identifier, token, or local path integrity.")
 
-        # torch_device is renamed from torch.device to avoid name conflict
-        _model = _model.to(torch_device(device))
-
-        return cls(_model)
+        pipeline_instance = pipeline_instance.to(torch_device(device))
+        return cls(pipeline_instance)    
 
     @staticmethod
     def _get_diarisation_kwargs(**kwargs) -> dict:
