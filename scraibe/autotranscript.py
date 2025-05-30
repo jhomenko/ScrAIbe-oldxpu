@@ -113,27 +113,22 @@ class Scraibe:
             )
 
         # --- Initialize Diariser ---
-        # Filter component_kwargs to be more specific for Diariser.load_model
         diariser_load_kwargs = {}
-        if use_auth_token: # Pyannote uses 'token' or 'use_auth_token'
-            diariser_load_kwargs['use_auth_token'] = use_auth_token # Or 'token': use_auth_token if Diariser.load_model expects that
-        # Pass any other relevant kwargs from component_kwargs if Diariser.load_model expects them.
-        # For now, keeping it minimal to avoid unexpected argument errors.
-        # If Diariser.load_model takes generic **kwargs, you can pass more from component_kwargs after filtering.
-        # Example: known_diariser_params = ['some_diariser_param']
-        # for k, v in component_kwargs.items():
-        #     if k in known_diariser_params: diariser_load_kwargs[k] = v
+        if use_auth_token: # use_auth_token is a named param of Scraibe.__init__
+            # Pyannote typically uses 'use_auth_token'. If your Diariser.load_model specifically expects 'token', adjust here.
+            # Based on your Diariser.load_model signature, it expects 'use_auth_token'.
+            diariser_load_kwargs['use_auth_token'] = use_auth_token
             
-        if isinstance(dia_model, Diariser):
+        if isinstance(dia_model, Diariser): # dia_model is a named param of Scraibe.__init__
             self.diariser = dia_model
             if self.verbose: print(f"Using provided Diariser instance: {self.diariser}")
-        else: # Handles string name for model or None for default
+        else: 
             if self.verbose: 
-                print(f"Loading Diariser: model='{dia_model if dia_model else 'default'}', device='{self.target_device}'")
+                print(f"Loading Diariser: model='{dia_model if dia_model else 'default (using PYANNOTE_DEFAULT_CONFIG)'}', device='{self.target_device}'")
             self.diariser = Diariser.load_model(
-                model_name_or_path=dia_model, # Pass the name/path or None
-                device=self.target_device,    # Explicit device argument
-                **diariser_load_kwargs        # Filtered additional kwargs
+                model=dia_model,  # <<< CORRECTED: Use 'model' instead of 'model_name_or_path'
+                device=self.target_device,
+                **diariser_load_kwargs
             )
 
         if self.verbose:
