@@ -56,6 +56,9 @@ from whisper import Whisper as OpenAIWhisperModel # Renamed for clarity
 from whisper import load_model as openai_whisper_load_model # Renamed
 from whisper.tokenizer import TO_LANGUAGE_CODE as OPENAI_WHISPER_TO_LANGUAGE_CODE # Renamed
 
+from ipex_llm.transformers import AutoModelForSpeechSeq2Seq
+from transformers import WhisperProcessor
+
 # FasterWhisper imports
 from faster_whisper import WhisperModel as FasterWhisperModel
 from faster_whisper.tokenizer import _LANGUAGE_CODES as FASTER_WHISPER_LANGUAGE_CODES
@@ -167,135 +170,332 @@ class Transcriber(ABC):
     def __repr__(self) -> str:
         return f"{self.__class__.__name__}(model_name='{self.model_name}')"
 
-
 class OpenAIWhisperIPEXLLMTranscriber(Transcriber):
     """
-    Transcriber for OpenAI's Whisper model, with optional IPEX-LLM optimization.
+    Transcriber for OpenAI's Whisper model, using ipex_llm.transformers for loading
+    and optimization, especially for Intel XPUs.
     """
-    def __init__(self, model_name: str, model_instance: OpenAIWhisperModel) -> None:
-        super().__init__(model_name, model_instance)
+    def __init__(self, 
+                 model_name: str, 
+                 model_instance: AutoModelForSpeechSeq2Seq, # Model instance is now from ipex_llm.transformers
+                 processor_instance: WhisperProcessor,    # Explicitly store processor
+                 target_device: torch.device,
+                 low_bit_format: Optional[str] = None):   # Store low_bit for reference
+        
+        # Call super().__init__ using the new 'processor' argument in the ABC if you've added it,
+        # or handle it as needed. For now, let's assume the ABC's __init__ is:
+        # super().__init__(model_name, model_instance, processor_instance)
+        # If your Transcriber ABC's __init__ is still (model_name, model_instance), 
+        # you'll store processor separately:
+        self.model_name = model_name
+        self.model = model_instance
+        self.processor = processor_instance # Store the WhisperProcessor
+        self.target_device = target_device
+        self.low_bit_format = low_bit_format
+        self.verbose = False # Or get from kwargs if needed
 
     @classmethod
     def load_model(cls,
                    model_name: str = "medium",
-                   download_root: Optional[str] = WHISPER_DEFAULT_PATH,
-                   device_option: Optional[Union[str, torch.device]] = SCRAIBE_TORCH_DEVICE,
-                   in_memory: bool = False, # Specific to openai-whisper
-                   # IPEX-LLM specific arguments
-                   use_ipex_llm: bool = True,
-                   low_bit: str = 'bf16', # Default for XPU. Options: 'sym_int4', 'nf4', 'fp16', 'fp8' etc., or None
-                   **kwargs: Any # Catches other potential args for whisper_load_model
+                   download_root: Optional[str] = None,
+                   device_option: Optional[Union[str, torch.device]] = None,
+                   use_ipex_llm: bool = True, # This class is specifically for IPEX-LLM
+                   low_bit: str = 'bf16',    # Default low_bit for this XPU-focused class
+                   use_auth_token: Optional[str] = None,
+                   in_memory: bool = False, # Not directly used by AutoModelForSpeechSeq2Seq.from_pretrained
+                                            # but kept for signature compatibility if load_transcriber passes it.
+                   **kwargs: Any # Catches other potential args like 'trust_remote_code'
                    ) -> 'OpenAIWhisperIPEXLLMTranscriber':
 
-        target_device = torch.device(device_option if device_option else SCRAIBE_TORCH_DEVICE)
-        
-        # Determine the initial device for loading the model
-        initial_load_device = target_device
-        
-        # Condition for performing IPEX-LLM XPU optimization
-        perform_ipex_xpu_optimization = (use_ipex_llm and 
-                                         ipex_llm is not None and 
-                                         target_device.type == 'xpu')
+        if not use_ipex_llm:
+            # This class is intended for IPEX-LLM usage.
+            # If use_ipex_llm is False, it implies a different loading strategy or class should be used.
+            # For now, we proceed assuming IPEX-LLM is desired for this transcriber type.
+            warnings.warn("OpenAIWhisperIPEXLLMTranscriber is intended for use_ipex_llm=True. "
+                          "Proceeding with IPEX-LLM loading.", UserWarning)
 
-        if perform_ipex_xpu_optimization:
-            # For IPEX-LLM XPU optimization, we must load the model to CPU first
-            initial_load_device = torch.device('cpu')
-            print(f"Loading OpenAI Whisper model: '{model_name}' to CPU for IPEX-LLM XPU optimization.")
-        else:
-            print(f"Loading OpenAI Whisper model: '{model_name}' for device: '{target_device}'.")
+        if ipex_llm is None:
+            raise ImportError("IPEX-LLM library not found, cannot use OpenAIWhisperIPEXLLMTranscriber.")
 
-        # Load the model using the determined initial_load_device
-        _model = openai_whisper_load_model(name=model_name,
-                                           download_root=download_root,
-                                           device=initial_load_device, # Load to CPU if optimizing for XPU, else target_device
-                                           in_memory=in_memory)
+        target_device_str = str(device_option if device_option else SCRAIBE_TORCH_DEVICE)
+        target_device = torch.device(target_device_str)
+
+        print(f"Loading Whisper model '{model_name}' using ipex_llm.transformers "
+              f"with low_bit='{low_bit}' for device '{target_device_str}'")
+
+        # 1. Load WhisperProcessor from transformers
+        try:
+            processor = WhisperProcessor.from_pretrained(
+                model_name,
+                cache_dir=download_root,
+                token=use_auth_token
+            )
+        except Exception as e:
+            warnings.warn(f"Failed to load WhisperProcessor for '{model_name}': {e}", RuntimeWarning)
+            raise
+
+        # 2. Load model using ipex_llm.transformers.AutoModelForSpeechSeq2Seq
+        # Determine torch_dtype based on low_bit for explicit control if needed.
+        torch_dtype_map = {
+            'bf16': torch.bfloat16,
+            'fp16': torch.float16,
+            'fp32': torch.float32, # Forcing fp32 if low_bit is None or 'fp32'
+        }
+        # If low_bit is like 'sym_int4', 'sym_int8', IPEX-LLM handles dtype internally with load_in_low_bit.
+        # For 'bf16'/'fp16', explicitly setting torch_dtype can be beneficial.
+        effective_torch_dtype = torch_dtype_map.get(low_bit.lower() if isinstance(low_bit, str) else "fp32", "auto") # Default to auto or fp32
+        if effective_torch_dtype == "auto" and low_bit not in ['bf16', 'fp16', 'fp32', None]: # if low_bit is a quant format like int4
+            effective_torch_dtype = None # Let IPEX-LLM handle it fully for int4/int8
+
+        if target_device.type == 'cpu' and effective_torch_dtype == torch.float16:
+            warnings.warn("FP16 is not natively supported or optimal on CPU for some operations; IPEX-LLM might upcast. "
+                          "Consider 'bf16' if supported, or allow IPEX-LLM to manage dtype with 'load_in_low_bit'.")
         
-        print(f"Model '{model_name}' initially loaded on device: {_model.device}")
+        # Additional from_pretrained kwargs that might be useful or need to be exposed
+        from_pretrained_kwargs = kwargs.copy()
+        from_pretrained_kwargs.setdefault('trust_remote_code', True) # Often needed for custom models/IPEX-LLM
 
-        if perform_ipex_xpu_optimization:
-            print(f"Attempting IPEX-LLM optimization for OpenAI Whisper model (currently on {_model.device}) with low_bit='{low_bit}'...")
+        try:
+            # optimize_model=True and load_in_low_bit are key IPEX-LLM parameters
+            model = AutoModelForSpeechSeq2Seq.from_pretrained(
+                model_name,
+                load_in_low_bit=low_bit,
+                optimize_model=True, # Recommended by IPEX-LLM benchmark
+                torch_dtype=effective_torch_dtype if effective_torch_dtype else "auto", # "auto" lets Transformers decide based on model config/precision
+                cache_dir=download_root,
+                token=use_auth_token,
+                **from_pretrained_kwargs
+            )
+        except Exception as e:
+            warnings.warn(f"Failed to load model '{model_name}' using IPEX-LLM AutoModelForSpeechSeq2Seq: {e}", RuntimeWarning)
+            raise
+
+        model = model.eval() # Set to evaluation mode
+
+        # Move model to the target device AFTER loading and optimization
+        try:
+            model = model.to(target_device)
+            loaded_model_dtype = next(model.parameters()).dtype # Check actual dtype after loading and moving
+            print(f"IPEX-LLM Whisper model '{model_name}' loaded. Target device: '{target_device}'. "
+                  f"Effective model dtype: {loaded_model_dtype}. Low-bit optimization: '{low_bit}'.")
+        except Exception as e:
+            warnings.warn(f"Failed to move IPEX-LLM loaded model to '{target_device}': {e}. "
+                          f"Model remains on its current device: {model.device}", RuntimeWarning)
+            target_device = model.device # Update target_device to the actual model device
+
+        return cls(model_name, model, processor, target_device, low_bit_format=low_bit)
+
+    def transcribe(self, audio: Union[str, torch.Tensor, np.ndarray], **kwargs: Any) -> Dict[str, Any]:
+        """
+        Transcribe audio using the IPEX-LLM loaded Whisper model and its generate method.
+
+        Args:
+            audio (Union[str, torch.Tensor, np.ndarray]): Audio input.
+                   If ndarray or Tensor, assumed to be a 1D float32 waveform at 16kHz.
+                   If str, it's a path that this method currently doesn't handle (needs pre-loading).
+                   This method expects Scraibe to pass the processed waveform Tensor.
+            **kwargs:
+                language (str, optional): Language of the audio. Defaults to 'en'.
+                task (str, optional): Task: 'transcribe' or 'translate'. Defaults to 'transcribe'.
+                verbose (bool, optional): Controls some print statements here.
+                Other arguments will be passed to model.generate() if recognized.
+        Returns:
+            Dict[str, Any]: {"text": str, "segments": List[Dict], "language": str}
+        """
+        if not self.processor or not self.model:
+            raise RuntimeError("Transcriber is not properly initialized with a model and processor.")
+
+        self.verbose = kwargs.get("verbose", self.verbose) # Update instance verbose if passed
+
+        if isinstance(audio, str):
+            # This simplified transcriber expects a pre-loaded waveform.
+            # Scraibe's get_audio_file().waveform should handle path loading.
+            raise NotImplementedError("This transcribe method expects a waveform Tensor, not a path. "
+                                      "Ensure Scraibe passes audio_processor.waveform.")
+        elif isinstance(audio, np.ndarray):
+            audio = torch.from_numpy(audio.astype(np.float32))
+        elif not isinstance(audio, torch.Tensor):
+            raise TypeError(f"Expected audio to be str, Tensor, or ndarray, but got {type(audio)}")
+
+        # Ensure audio is a 1D float32 tensor for the processor
+        if audio.ndim > 1:
+            audio = audio.squeeze() # Remove batch dim if present, assuming (1, N)
+        if audio.ndim != 1:
+            raise ValueError(f"Audio waveform must be 1D, but got {audio.ndim} dimensions.")
+        if audio.dtype != torch.float32:
+            audio = audio.to(torch.float32)
+
+        # 1. Preprocess audio to input features
+        try:
+            # Processor expects numpy array or list of floats for raw audio.
+            input_features = self.processor(
+                audio.cpu().numpy(), # Convert to numpy for processor
+                sampling_rate=16000, # Whisper standard
+                return_tensors="pt"
+            ).input_features
+        except Exception as e:
+            warnings.warn(f"Error during processor feature extraction: {e}", RuntimeWarning)
+            raise
+
+        # Move input features to the same device and dtype as the model expects
+        try:
+            model_first_param_dtype = next(self.model.parameters()).dtype
+            if input_features.device != self.target_device:
+                input_features = input_features.to(self.target_device)
+            if input_features.dtype != model_first_param_dtype:
+                if self.verbose:
+                    print(f"Casting input_features from {input_features.dtype} to model dtype {model_first_param_dtype} "
+                          f"for device {self.target_device}.")
+                input_features = input_features.to(model_first_param_dtype)
+        except Exception as e:
+            warnings.warn(f"Could not move/cast input_features to target device/dtype: {e}", RuntimeWarning)
+            # Proceeding, but there might be issues.
+
+        # 2. Get forced_decoder_ids for language and task
+        language = kwargs.get("language", "en")
+        task = kwargs.get("task", "transcribe")
+        
+        generate_options = self._get_transcribe_kwargs(**kwargs) # Get generate-specific kwargs
+
+        try:
+            # Note: Some WhisperProcessor versions might not have language='ja' if model is not multilingual supporting Japanese.
+            # It's safer to only set language if model is multilingual and lang is supported.
+            # However, get_decoder_prompt_ids should handle this by defaulting or raising error.
+            forced_decoder_ids = self.processor.get_decoder_prompt_ids(language=language, task=task)
+        except Exception as e:
+            warnings.warn(f"Could not get forced_decoder_ids for language='{language}', task='{task}': {e}. "
+                          "Proceeding without them. This may affect multilingual models or task accuracy.", UserWarning)
+            forced_decoder_ids = None
+        
+        if self.verbose:
+            print(f"Transcribing with: language='{language}', task='{task}', "
+                  f"model_device='{self.model.device}', input_features_device='{input_features.device}', "
+                  f"input_features_dtype='{input_features.dtype}'")
+            if forced_decoder_ids:
+                 print(f"Using forced_decoder_ids: {self.processor.tokenizer.convert_ids_to_tokens(forced_decoder_ids[0][1:-1]) if forced_decoder_ids and len(forced_decoder_ids[0]) > 2 else 'start/end tokens'}")
+
+
+        # 3. Generate token IDs
+        transcription_text = ""
+        with torch.no_grad():
             try:
-                # Ensure model is on CPU before optimization (should be if initial_load_device was 'cpu')
-                if _model.device.type != 'cpu':
-                    _model = _model.to('cpu')
-                    print(f"Moved model to CPU for optimization. Current device: {_model.device}")
-
-                _model = ipex_llm.optimize_model(_model,
-                                                 low_bit=low_bit,
-                                                 optimize_llm=True, # Default, good for Whisper
-                                                 # cpu_embedding=True, # Optional: experiment if OOM issues on XPU
-                                                 )
-                print(f"IPEX-LLM optimization successful. Optimized model is on device: {_model.device}")
+                # Common generate kwargs: max_length, num_beams, temperature, etc.
+                # Add use_cache=True as seen in benchmark for potential speedup.
+                generate_options.setdefault('use_cache', True)
+                if forced_decoder_ids:
+                    generate_options['forced_decoder_ids'] = forced_decoder_ids
                 
-                # After successful optimization, move the model to the target XPU device
-                print(f"Moving optimized model to target device: {target_device}...")
-                _model = _model.to(target_device)
-                print(f"Model is now on device: {_model.device}")
+                predicted_ids = self.model.generate(input_features, **generate_options)
+
+                if self.target_device.type == "xpu":
+                    torch.xpu.synchronize()
+
+                # 4. Decode token IDs to text
+                transcription_text = self.processor.batch_decode(predicted_ids, skip_special_tokens=True)[0]
+                
+                if self.verbose:
+                    print(f"--- Transcription ---")
+                    print(transcription_text)
+                    print(f"--- End Transcription ---")
 
             except Exception as e:
-                warnings.warn(f"IPEX-LLM optimization failed for OpenAI Whisper model: {e}. Model remains on {_model.device}.")
-                # If optimization fails, the model is likely still the CPU version.
-                # Move it to the target_device (XPU) anyway so the rest of the application can proceed.
-                if str(_model.device) != str(target_device):
-                    try:
-                        _model = _model.to(target_device)
-                        warnings.warn(f"Model (post-failed-optimization) moved to {target_device}. Current device: {_model.device}")
-                    except Exception as move_e:
-                        warnings.warn(f"Could not move model to {target_device} after failed optimization: {move_e}")
-        
-        elif use_ipex_llm: # IPEX-LLM was desired but conditions not met for XPU optimization
-            if ipex_llm is None:
-                warnings.warn("IPEX-LLM library not found. Skipping IPEX-LLM optimization.")
-            elif target_device.type != 'xpu':
-                warnings.warn(f"IPEX-LLM optimization skipped: Target device is '{target_device.type}', not 'xpu'.")
-        
-        # If no IPEX XPU optimization was performed, or if it failed and model was moved,
-        # ensure model is on the final target_device if it's not already.
-        if str(_model.device) != str(target_device):
-            print(f"Ensuring model is on final target device {target_device}. Current: {_model.device}")
-            _model = _model.to(target_device)
-            print(f"Model finally on device: {_model.device}")
-            
-        return cls(model_name, _model)
-        
-    def transcribe(self, audio: Union[str, Tensor, ndarray], **kwargs: Any) -> Dict[str, Any]:
-        """
-        Transcribe using the OpenAI Whisper model (potentially IPEX-LLM optimized).
-        """
-        transcribe_kwargs = self._get_transcribe_kwargs(**kwargs)
+                warnings.warn(f"Error during model.generate() or decoding: {e}", RuntimeWarning)
+                # If you want to see the full traceback for debugging:
+                # import traceback
+                # traceback.print_exc()
+                # For now, we'll return an empty transcription on error.
+                return {"text": "", "segments": [], "language": language}
 
-        # OpenAI's model.transcribe already returns a dictionary.
-        # No explicit torch.xpu.amp.autocast typically needed here if ipex-llm optimized the model
-        # to operate in a specific precision (e.g., bf16 or low-bit).
-        result_dict = self.model.transcribe(audio, **transcribe_kwargs)
-        return result_dict
+
+        # Basic segment creation (full text as one segment)
+        # TODO: Implement more detailed segmentation if required, e.g., by analyzing predicted_ids for timestamps
+        # or using other features of the generation output if available.
+        segments = []
+        if transcription_text:
+            # This is a placeholder for segments. Duration is unknown here.
+            segments.append({"start": 0.0, "end": 0.0, "text": transcription_text.strip()})
+
+        return {
+            "text": transcription_text.strip(),
+            "segments": segments,
+            "language": language # Return the language used for transcription
+        }
 
     @staticmethod
     def _get_transcribe_kwargs(**kwargs: Any) -> Dict[str, Any]:
         """
-        Prepare keyword arguments for OpenAI Whisper's `transcribe` method.
-        It accepts **decode_options.
+        Prepare keyword arguments for Hugging Face model's `generate` method.
+        This filters kwargs passed to `transcribe` and keeps only those valid for `generate`.
         """
-        # Known decode options for OpenAI Whisper (can be extended)
-        # See whisper.decode.DecodingOptions
-        known_options = [
-            "language", "task", "fp16", "temperature", "sample_len", "best_of",
-            "beam_size", "patience", "length_penalty", "prompt", "prefix", "suppress_blank",
-            "suppress_tokens", "without_timestamps", "max_initial_timestamp",
-            "word_timestamps", "prepend_punctuations", "append_punctuations", "verbose",
-            "patience", "length_penalty", "condition_on_previous_text", "logprob_threshold",
-            "no_speech_threshold", "compression_ratio_threshold"
+        # Common parameters for `generate`. Refer to Hugging Face docs for full list.
+        # (transformers.generation.GenerationConfig)
+        known_generate_options = [
+            # Controlling output length
+            "max_length", "max_new_tokens", "min_length", "min_new_tokens",
+            # Strategy
+            "early_stopping", "num_beams", "num_beam_groups", "do_sample", "use_cache",
+            # Sampling parameters (if do_sample=True)
+            "temperature", "top_k", "top_p", "typical_p", "epsilon_cutoff", "eta_cutoff",
+            # Advanced
+            "repetition_penalty", "length_penalty", "no_repeat_ngram_size",
+            "encoder_no_repeat_ngram_size", "bad_words_ids", "force_words_ids",
+            "forced_bos_token_id", "forced_eos_token_id", "remove_invalid_values",
+            "suppress_tokens", "begin_suppress_tokens", "forced_decoder_ids",
+            "num_return_sequences", "output_attentions", "output_hidden_states",
+            "output_scores", "return_dict_in_generate",
+            # Whisper specific that might be passed to generate or handled by processor:
+            # "language", "task", (these are handled for forced_decoder_ids)
+            # Parameters from original OpenAI Whisper DecodingOptions that map to generate:
+            "patience", # (can map to early_stopping related logic or beam search patience if available)
+            # "sample_len" -> max_new_tokens
+            # "best_of" -> num_return_sequences (and then select best, or num_beams with do_sample=True)
+            # "beam_size" -> num_beams
+            # "prompt" -> "prompt_ids" or "prefix_allowed_tokens_fn" (more complex)
+            # "prefix" -> (similar to prompt)
+            # "suppress_blank" -> (handled by tokenizer options usually, or post-processing)
+            # "without_timestamps" -> (if model supports, or post-processing)
+            # "max_initial_timestamp" -> (specific to whisper's timestamp logic)
         ]
-        final_kwargs = {k: v for k, v in kwargs.items() if k in known_options}
         
-        # Handle verbose explicitly as it's common and OpenAI Whisper uses None for default (no output)
-        if "verbose" in final_kwargs and final_kwargs["verbose"] is None:
-            pass
-        elif "verbose" not in final_kwargs or not final_kwargs.get("verbose", False) :
-            final_kwargs["verbose"] = None # Default to no detailed console output from whisper
+        final_kwargs = {}
+        for k, v in kwargs.items():
+            if k in known_generate_options:
+                final_kwargs[k] = v
+            elif k == "sample_len" and "max_new_tokens" not in final_kwargs: # map sample_len
+                final_kwargs["max_new_tokens"] = v
+            elif k == "beam_size" and "num_beams" not in final_kwargs: # map beam_size
+                 final_kwargs["num_beams"] = v
+            # Add more mappings if needed from whisper's DecodingOptions to HF generate()
+        
+        # Ensure num_beams is > 0 if set, and do_sample is False for beam search
+        if final_kwargs.get("num_beams", 0) > 0:
+            final_kwargs.setdefault("do_sample", False)
+            if final_kwargs["num_beams"] == 1 and not final_kwargs.get("do_sample", False): # Greedy
+                final_kwargs.pop("num_beams", None) # No need for num_beams=1 in greedy
+
+        # Default to greedy search if no strategy is specified
+        if not final_kwargs.get("do_sample", False) and final_kwargs.get("num_beams", 1) <=1:
+            # This is effectively greedy. Ensure no conflicting sampling params.
+            final_kwargs.pop("temperature", None)
+            final_kwargs.pop("top_k", None)
+            final_kwargs.pop("top_p", None)
 
         return final_kwargs
 
+
+# Ensure your FasterWhisperTranscriber and load_transcriber factory function are still in this file
+# The load_transcriber factory will need to call this new version of 
+# OpenAIWhisperIPEXLLMTranscriber.load_model correctly.
+# The existing call in load_transcriber:
+#   return OpenAIWhisperIPEXLLMTranscriber.load_model(
+#       model_name=model_name,
+#       download_root=download_root,
+#       device_option=target_device, # This 'device_option' is the param name in the new load_model
+#       **kwargs # kwargs here are from load_transcriber's **kwargs
+#                # which are from Scraibe.__init__'s component_kwargs.
+#                # These include `low_bit`, `use_ipex_llm`, `use_auth_token`.
+#   )
+# This call structure should still be compatible with the refactored class method.
 
 class FasterWhisperTranscriber(Transcriber):
     """
