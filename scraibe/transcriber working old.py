@@ -57,7 +57,6 @@ from whisper import Whisper as OpenAIWhisperModel # Renamed for clarity
 from whisper import load_model as openai_whisper_load_model # Renamed
 from whisper.tokenizer import TO_LANGUAGE_CODE as OPENAI_WHISPER_TO_LANGUAGE_CODE # Renamed
 
-from transformers import pipeline
 from ipex_llm.transformers import AutoModelForSpeechSeq2Seq
 from transformers import WhisperProcessor
 
@@ -81,10 +80,7 @@ except ImportError:
 SAMPLE_RATE = 16000
 #N_FFT = 400
 #HOP_LENGTH = 160 # self.processor.feature_extractor.hop_length
-chunk_length_s = 30 # seconds
-stride_length_s = 5 # seconds
-batch_size = 8
-return_timestamps = True # For segment-level timestamps
+#CHUNK_LENGTH = 30 # seconds
 #N_SAMPLES_PER_CHUNK = CHUNK_LENGTH * SAMPLE_RATE # 480000
 #N_FRAMES_PER_CHUNK = N_SAMPLES_PER_CHUNK // HOP_LENGTH # 3000 frames for a 30-second window
 # N_MELS = 80 # self.processor.feature_extractor.feature_size or self.model.config.num_mel_bins
@@ -159,7 +155,8 @@ class OpenAIWhisperIPEXLLMTranscriber(Transcriber):
     """
     def __init__(self, 
                  model_name: str, 
-                 model_instance: AutoModelForSpeechSeq2Seq,
+                 # Model instance can now be either IPEX-LLM AutoModel or IPEX-optimized HF model
+                 model_instance: Union[AutoModelForSpeechSeq2Seq, WhisperForConditionalGeneration], 
                  processor_instance: WhisperProcessor,
                  target_device: torch.device,
                  low_bit_format: Optional[str] = None,
@@ -167,196 +164,348 @@ class OpenAIWhisperIPEXLLMTranscriber(Transcriber):
         super().__init__(model_name, model_instance, processor_instance, verbose=verbose)
         self.target_device = target_device
         self.low_bit_format = low_bit_format
-        self.asr_pipeline = None # Initialize as None for potential lazy loading
 
-    def _initialize_pipeline(self):
-        if self.asr_pipeline is None:
-            if self.verbose:
-                print(f"Initializing ASR pipeline with model '{self.model_name}' on device '{self.target_device}'...")
+    @classmethod
+    def load_model(cls,
+                   model_name: str = "medium",
+                   download_root: Optional[str] = None, 
+                   device_option: Optional[Union[str, torch.device]] = None,
+                   use_ipex_llm: bool = True, # This flag now means "try IPEX-LLM specific loading first"
+                   low_bit: str = 'bf16', 
+                   use_auth_token: Optional[str] = None,
+                   verbose: bool = False,
+                   **kwargs: Any 
+                   ) -> 'OpenAIWhisperIPEXLLMTranscriber':
+
+        target_device_str = str(device_option if device_option else SCRAIBE_TORCH_DEVICE)
+        target_device = torch.device(target_device_str)
+
+        hf_model_id = model_name
+        official_short_names = ["tiny", "base", "small", "medium", "large", "large-v2", "large-v3"]
+        potential_short_name = model_name.replace(".en", "")
+        if potential_short_name in official_short_names and "/" not in model_name:
+            hf_model_id = f"openai/whisper-{model_name}"
+            if verbose: print(f"Interpreted model_name '{model_name}' as Hugging Face ID '{hf_model_id}'")
+
+        if verbose:
+            print(f"Loading Whisper model '{hf_model_id}' for device '{target_device_str}' with low_bit config: '{low_bit}'")
+
+        try:
+            processor = WhisperProcessor.from_pretrained(
+                hf_model_id, cache_dir=download_root, token=use_auth_token
+            )
+        except Exception as e:
+            warnings.warn(f"Failed to load WhisperProcessor for '{hf_model_id}': {e}", RuntimeWarning)
+            raise
+
+        model_instance = None
+        normalized_low_bit = low_bit.lower() if isinstance(low_bit, str) else ""
+        
+        # --- Strategy: Try IPEX-LLM loader first for actual low-bit (int4, specific strings).
+        # --- For fp16/bf16, try standard HF load + ipex.optimize() if IPEX is available.
+        
+        use_standard_hf_plus_ipex_optimize = False
+        torch_dtype_for_hf_load = "auto" # Default for standard HF loading
+
+        if normalized_low_bit in ["bf16", "fp16", "float16"]:
+            use_standard_hf_plus_ipex_optimize = True
+            if normalized_low_bit == "bf16":
+                torch_dtype_for_hf_load = torch.bfloat16
+            else: # fp16
+                torch_dtype_for_hf_load = torch.float16
+            if verbose: print(f"INFO: Will attempt to load standard HF model in {normalized_low_bit} and apply ipex.optimize().")
+        
+        elif use_ipex_llm and ipex_llm is not None and normalized_low_bit not in ["fp32", "none", ""]:
+            # Use IPEX-LLM AutoModel for specific low-bit quantizations (e.g., int4, woq_int4)
+            if verbose: print(f"INFO: Attempting to load with ipex_llm.transformers for low_bit='{low_bit}'")
+            from_pretrained_args = kwargs.copy()
+            from_pretrained_args.update({
+                'trust_remote_code': from_pretrained_args.get('trust_remote_code', True),
+                'cache_dir': download_root, 'token': use_auth_token
+            })
+            if target_device.type == 'xpu': from_pretrained_args.setdefault('cpu_embedding', False)
+
+            if normalized_low_bit in ["int4", "4bit"]:
+                from_pretrained_args.update({'load_in_4bit': True, 'optimize_model': False})
+                if 'torch_dtype' in from_pretrained_args: from_pretrained_args.pop('torch_dtype') # Let IPEX-LLM handle
+            else: # Specific IPEX-LLM string like "woq_int4", "sym_int4", etc.
+                from_pretrained_args.update({'load_in_low_bit': low_bit, 'optimize_model': True})
+                if 'torch_dtype' in from_pretrained_args: from_pretrained_args.pop('torch_dtype')
+
+            if verbose: print(f"DEBUG: IPEX-LLM from_pretrained args: {from_pretrained_args}")
             try:
-                # Determine device index if XPU (e.g., "xpu:0" -> 0)
-                device_index = -1 # Default for CPU
-                if self.target_device.type == "xpu":
-                    device_index = self.target_device.index if self.target_device.index is not None else 0
-                elif self.target_device.type == "cuda": # Example for CUDA
-                    device_index = self.target_device.index if self.target_device.index is not None else 0
-                
-                self.asr_pipeline = pipeline(
-                    "automatic-speech-recognition",
-                    model=self.model,
-                    tokenizer=self.processor.tokenizer,
-                    feature_extractor=self.processor.feature_extractor,
-                    device=device_index, # Pipeline expects integer device index for CUDA/XPU or string "cpu"
-                    torch_dtype=next(self.model.parameters()).dtype
-                     # Pass the model's dtype (e.g., bfloat16)
-                )
-                if self.verbose: print("ASR pipeline initialized.")
+                model_instance = AutoModelForSpeechSeq2Seq.from_pretrained(hf_model_id, **from_pretrained_args)
             except Exception as e:
-                warnings.warn(f"Failed to initialize ASR pipeline: {e}", RuntimeWarning)
+                warnings.warn(f"Failed to load model '{hf_model_id}' using IPEX-LLM AutoModel: {e}. "
+                              "Will attempt standard Hugging Face loading if applicable.", RuntimeWarning)
+                if normalized_low_bit in ["bf16", "fp16", "float16"]: # Fallback to standard HF + IPEX optimize
+                    use_standard_hf_plus_ipex_optimize = True
+                else:
+                    raise # If it was a specific IPEX-LLM low-bit string and failed, re-raise
+        else: # Default to standard HF loading (e.g., for fp32 or if IPEX-LLM not used/available)
+            use_standard_hf_plus_ipex_optimize = True
+            if normalized_low_bit == "bf16": torch_dtype_for_hf_load = torch.bfloat16
+            elif normalized_low_bit == "fp16": torch_dtype_for_hf_load = torch.float16
+            else: torch_dtype_for_hf_load = torch.float32 # Default to FP32 for standard load if no low_bit match
+
+        if use_standard_hf_plus_ipex_optimize:
+            if verbose: print(f"INFO: Loading standard Hugging Face model '{hf_model_id}' with torch_dtype='{torch_dtype_for_hf_load}'.")
+            try:
+                model_instance = WhisperForConditionalGeneration.from_pretrained(
+                    hf_model_id,
+                    torch_dtype=torch_dtype_for_hf_load,
+                    cache_dir=download_root,
+                    token=use_auth_token,
+                    trust_remote_code=kwargs.get('trust_remote_code', True)
+                )
+                if verbose: print("Standard HF model loaded. Applying ipex.optimize() if available and on XPU.")
+                
+                if target_device.type == 'xpu' and ipex is not None:
+                    try:
+                        if verbose: print(f"INFO: Applying ipex.optimize(model, dtype={torch_dtype_for_hf_load}) for XPU.")
+                        # For ipex.optimize, cpu_embedding is not a direct param.
+                        # It's more about optimizing the existing model structure for XPU.
+                        model_instance = ipex.optimize(model_instance.eval(), dtype=torch_dtype_for_hf_load, inplace=True, weights_prepack=False)
+                        if hasattr(model_instance, 'to'): # Optimized model should still have .to
+                             model_instance = model_instance.to(target_device) # Move after optimize
+                        else: # if ipex.optimize changes model type significantly
+                             warnings.warn("Model type changed after ipex.optimize, cannot call .to(device). Assuming it's on target device or CPU.", UserWarning)
+                             model_instance.eval() # Ensure eval modebatch_decode
+                        
+                        # If cpu_embedding was true for XPU, and we used standard HF load,
+                        # one might need to manually move embedding layers back to CPU if ipex.optimize put them on XPU.
+                        # This is complex. For now, let's assume ipex.optimize handles dtypes and device placement appropriately.
+                        if kwargs.get('cpu_embedding', False) and target_device.type == 'xpu':
+                             warnings.warn("cpu_embedding=True was requested, but after standard HF load + ipex.optimize, "
+                                           "manual movement of embeddings to CPU is not implemented here. Embeddings will be on model device.", UserWarning)
+
+                    except Exception as e_ipex:
+                        warnings.warn(f"ipex.optimize() failed: {e_ipex}. Using model without this IPEX optimization.", RuntimeWarning)
+                        if hasattr(model_instance, 'to'): model_instance = model_instance.to(target_device) # Still try to move original
+                        model_instance.eval()
+                else: # Not XPU or IPEX not available
+                    if hasattr(model_instance, 'to'): model_instance = model_instance.to(target_device)
+                    model_instance.eval()
+
+            except Exception as e_hf_load:
+                warnings.warn(f"Failed to load model '{hf_model_id}' using standard Hugging Face loader: {e_hf_load}", RuntimeWarning)
                 raise
-        if self.asr_pipeline is None: # Check again after attempt
-             raise RuntimeError("ASR Pipeline could not be initialized.")
+
+        if model_instance is None:
+            raise RuntimeError(f"Model instance could not be created for '{hf_model_id}' with config '{low_bit}'.")
+
+        model_instance = model_instance.eval() # Final ensure eval mode
+        
+        # Final check and move to device, though should be done by loaders/optimizer
+        try:
+            if model_instance.device != target_device and hasattr(model_instance, 'to'):
+                model_instance = model_instance.to(target_device)
+            actual_model_dtype = next(model_instance.parameters()).dtype
+            if verbose:
+                print(f"Final Whisper model '{hf_model_id}' ready. Device: '{model_instance.device}'. "
+                      f"Dtype: {actual_model_dtype}. Original low_bit request: '{low_bit}'.")
+        except Exception as e_final_move:
+            warnings.warn(f"Error during final model device placement/check: {e_final_move}", UserWarning)
 
 
-    # load_model remains the same as it correctly loads self.model and self.processor
+        return cls(hf_model_id, model_instance, processor, model_instance.device, low_bit_format=low_bit, verbose=verbose)
 
+    # _get_transcribe_kwargs and transcribe methods remain the same as my *very last complete suggestion*
+    # (the one that uses a single model.generate() call with full features and refined kwargs)
     def _get_transcribe_kwargs(self, **kwargs: Any) -> Dict[str, Any]:
-        # This method now prepares kwargs for the pipeline's __call__ method,
-        # specifically for its `generate_kwargs` parameter, AND for top-level pipeline args.
-        pipeline_call_args = {}
-        generate_specific_kwargs = {}
-
-        # Pipeline specific arguments (see ASR Pipeline docs)
-        # https://huggingface.co/docs/transformers/main_classes/pipelines#transformers.AutomaticSpeechRecognitionPipeline
-        pipeline_direct_params = [
-            "chunk_length_s", "stride_length_s", "batch_size", "return_timestamps" 
-            # "language", "task" can also be top-level for pipeline or in generate_kwargs
-        ]
-        # Generation specific arguments (passed via generate_kwargs)
-        generate_config_params = [
-            "language", "task", "temperature", "condition_on_prev_tokens",
-            "initial_prompt", "prompt_ids", "decoder_input_ids", # Usually not needed if lang/task set
-            "return_token_timestamps", # if 'word' for return_timestamps
+        # ... (as provided in my previous response, starting with generate_params = {})
+        # ... (it sets return_timestamps=True, return_dict_in_generate=True, temperature tuple etc.)
+        # ... (and handles num_beams, aiming to pass a float temperature if greedy for the ValueError)
+        # --- Start copy of _get_transcribe_kwargs from previous correct response ---
+        generate_params = {}
+        known_options = [
+            "language", "task", "temperature", "compression_ratio_threshold", 
+            "logprob_threshold", "no_speech_threshold", "condition_on_prev_tokens",
+            "initial_prompt", "prompt_ids", "decoder_input_ids",
+            "return_timestamps", "return_token_timestamps", 
             "num_beams", "patience", "length_penalty", "repetition_penalty",
             "no_repeat_ngram_size", "suppress_tokens", "begin_suppress_tokens",
             "max_length", "max_new_tokens", 
             "use_cache", "do_sample", "top_k", "top_p",
-            "return_dict_in_generate", # Usually True by default in pipeline for structured output
-            # Thresholds for fallback (if pipeline uses them similarly to model.generate)
-            "compression_ratio_threshold", "logprob_threshold", "no_speech_threshold",
+            "return_dict_in_generate", "attention_mask",
+            "is_multilingual", "num_segment_frames", "time_precision",
+            "time_precision_features", "return_segments", "force_unique_generate_call",
+            "prompt_condition_type"
         ]
-
         for k, v in kwargs.items():
-            if k in pipeline_direct_params:
-                pipeline_call_args[k] = v
-            elif k in generate_config_params:
-                generate_specific_kwargs[k] = v
-            elif k == "beam_size" and "num_beams" not in generate_specific_kwargs:
-                 generate_specific_kwargs["num_beams"] = v
-            elif k == "word_timestamps" and v is True : # map to pipeline's return_timestamps
-                 pipeline_call_args["return_timestamps"] = "word"
-        
-        # --- Defaults for pipeline ---
-        pipeline_call_args.setdefault('chunk_length_s', 30) # Default chunk length
-        pipeline_call_args.setdefault('batch_size', 1) # Default batch size for chunks, can be increased
-        # return_timestamps: True for segment, "word" for word-level. Let user pass via kwargs.
-        # If 'word_timestamps' was true, it's already set to "word". Otherwise, default to segment level.
-        pipeline_call_args.setdefault('return_timestamps', True) 
+            if k in known_options:
+                generate_params[k] = v
+            elif k == "beam_size" and "num_beams" not in generate_params:
+                 generate_params["num_beams"] = v
+            elif k == "word_timestamps" and v is True:
+                 generate_params["return_token_timestamps"] = True
+                 generate_params.setdefault("return_timestamps", True) 
 
-
-        # --- Defaults for generate_kwargs (similar to before) ---
-        generate_specific_kwargs.setdefault('language', None) 
-        generate_specific_kwargs.setdefault('task', "transcribe")
-        generate_specific_kwargs.setdefault('condition_on_prev_tokens', True)
-        generate_specific_kwargs.setdefault('temperature', (0.0, 0.2, 0.4, 0.6, 0.8, 1.0))
-        generate_specific_kwargs.setdefault('num_beams', 1) # Default to greedy
-        if generate_specific_kwargs.get('num_beams', 1) > 1:
-            generate_specific_kwargs['do_sample'] = False
+        generate_params.setdefault('language', None) 
+        generate_params.setdefault('task', "transcribe")
+        generate_params.setdefault('return_timestamps', True) 
+        generate_params.setdefault('return_dict_in_generate', True) 
+        generate_params.setdefault('condition_on_prev_tokens', True)
         
-        # The pipeline might handle temperature tuple better for its internal generate calls.
-        # Or it might expect a single float for initial calls per chunk too.
-        # For now, let's pass the tuple and see, as pipeline is higher level.
-        # If an error occurs, we might need to pass only generate_specific_kwargs['temperature'][0].
+        default_temp_tuple = (0.0, 0.2, 0.4, 0.6, 0.8, 1.0)
+        user_temp_setting = kwargs.get('temperature', default_temp_tuple)
         
-        pipeline_call_args['generate_kwargs'] = generate_specific_kwargs
-        return pipeline_call_args
+        # To address the ValueError: "temperature cannot be set to tuple for short-form"
+        # We pass only the *first* temperature from the desired sequence to the main generate call.
+        # The model's internal long-form logic (if robust) should use other thresholds for quality.
+        if isinstance(user_temp_setting, (list, tuple)) and user_temp_setting:
+            generate_params['temperature'] = float(user_temp_setting[0])
+        elif isinstance(user_temp_setting, (float, int)):
+            generate_params['temperature'] = float(user_temp_setting)
+        else: # Should not happen if default is tuple
+            generate_params['temperature'] = 0.0 
+            
+        generate_params.setdefault('num_beams', 1) # Default to greedy from CLI if not set
+        if generate_params['num_beams'] > 1:
+            generate_params['do_sample'] = False
+            # If beam searching, ensure temp is low (e.g. 0.0)
+            if generate_params.get('temperature', 0.0) > 0.1: # Allow small non-zero for beam
+                 warnings.warn(f"Beam search (num_beams={generate_params['num_beams']}) is active, "
+                               f"but temperature is {generate_params['temperature']}. Consider temp<=0.1 for beam search.", UserWarning)
+        elif generate_params.get('do_sample', False): # Explicit sampling
+             pass # Use temperature as set (which is now a float)
+        else: # Greedy (num_beams=1, do_sample=False implicitly or explicitly)
+            generate_params['do_sample'] = False
+            if generate_params.get('temperature') == 0.0: # Pure greedy
+                 generate_params.pop('temperature', None) # Remove to silence warning
 
+        generate_params.setdefault('use_cache', True)
+        generate_params.pop('max_new_tokens', None)
+        return generate_params
+        # --- End copy of _get_transcribe_kwargs ---
 
     def transcribe(self, audio: Union[str, torch.Tensor, np.ndarray], **kwargs: Any) -> Dict[str, Any]:
+        # ... (This method should be the one that calls self.processor once with truncation=False,
+        #      then self.model.generate once with full features and options from _get_transcribe_kwargs.
+        #      As per my previous full class example that aimed to fix the "short-form" ValueError)
+        # --- Start copy of transcribe from previous correct response ---
         if not self.processor or not self.model:
-            raise RuntimeError("Transcriber is not properly initialized with model and processor.")
-        
-        self._initialize_pipeline() # Ensure pipeline is created
-        if self.asr_pipeline is None: # Check again after attempt
-             raise RuntimeError("ASR Pipeline could not be initialized for transcription.")
+            raise RuntimeError("Transcriber is not properly initialized with a model and processor.")
 
-        current_call_verbose = kwargs.get("verbose", self.verbose) # For our own prints
+        current_call_verbose = kwargs.get("verbose", self.verbose)
 
-        # The pipeline expects raw audio data (numpy array or path)
-        # If `audio` is a Tensor, convert to numpy. Scraibe already provides waveform.
-        if isinstance(audio, torch.Tensor):
-            audio_input_for_pipeline = audio.cpu().numpy()
-            if audio_input_for_pipeline.ndim > 1: # Ensure 1D
-                audio_input_for_pipeline = audio_input_for_pipeline.squeeze()
+        if isinstance(audio, str):
+            raise NotImplementedError("This method expects a pre-processed waveform Tensor.")
         elif isinstance(audio, np.ndarray):
-            audio_input_for_pipeline = audio
-            if audio_input_for_pipeline.ndim > 1: audio_input_for_pipeline = audio_input_for_pipeline.squeeze()
-        elif isinstance(audio, str): # Pipeline can handle paths
-            audio_input_for_pipeline = audio
+            audio_waveform = torch.from_numpy(audio.astype(np.float32))
+        elif isinstance(audio, torch.Tensor):
+            audio_waveform = audio.to(torch.float32)
         else:
-            raise TypeError(f"Expected audio to be path (str), Tensor, or ndarray, got {type(audio)}")
+            raise TypeError(f"Expected audio to be Tensor or ndarray, got {type(audio)}")
 
-        pipeline_options = self._get_transcribe_kwargs(**kwargs)
-        # The `language` and `task` can often be passed at the top level of pipeline call too,
-        # or within `generate_kwargs`. _get_transcribe_kwargs puts them in generate_kwargs.
-        # Let's also ensure they are at top-level if pipeline prefers that.
-        if 'generate_kwargs' in pipeline_options and 'language' in pipeline_options['generate_kwargs']:
-            pipeline_options.setdefault('language', pipeline_options['generate_kwargs']['language'])
-        if 'generate_kwargs' in pipeline_options and 'task' in pipeline_options['generate_kwargs']:
-            pipeline_options.setdefault('task', pipeline_options['generate_kwargs']['task'])
+        if audio_waveform.ndim > 1: audio_waveform = audio_waveform.squeeze(0)
+        if audio_waveform.ndim != 1: raise ValueError(f"Audio waveform must be 1D, got {audio_waveform.ndim} dims.")
+
+        if current_call_verbose: 
+            print(f"Processing full audio waveform (duration: {audio_waveform.shape[0]/SAMPLE_RATE:.2f}s) with self.processor...")
         
+        try:
+            inputs = self.processor(
+                audio_waveform.cpu().numpy(), 
+                sampling_rate=SAMPLE_RATE, 
+                return_tensors="pt",
+                return_attention_mask=True,
+                truncation=False, 
+                padding="longest" 
+            )
+            input_features = inputs.input_features
+            attention_mask = inputs.get("attention_mask")
+
+            if current_call_verbose:
+                print(f"Shape of full input_features from processor: {input_features.shape}")
+                if attention_mask is not None:
+                    print(f"Shape of full attention_mask from processor: {attention_mask.shape}")
+                expected_min_frames = int((audio_waveform.shape[0] / SAMPLE_RATE) * (SAMPLE_RATE / (HOP_LENGTH if 'HOP_LENGTH' in globals() and HOP_LENGTH > 0 else 160))) - 100
+                if input_features.shape[-1] < expected_min_frames and input_features.shape[-1] <= 3000 :
+                     warnings.warn(f"Processor returned only {input_features.shape[-1]} frames for a "
+                                   f"{audio_waveform.shape[0]/SAMPLE_RATE:.2f}s audio. "
+                                   "Long-form transcription might fail or be incomplete.", UserWarning)
+        except Exception as e:
+            warnings.warn(f"Error during full audio feature extraction: {e}", RuntimeWarning)
+            raise
+
+        model_dtype = next(self.model.parameters()).dtype
+        try:
+            if input_features.device != self.target_device:
+                input_features = input_features.to(self.target_device)
+            if input_features.dtype != model_dtype:
+                if current_call_verbose: print(f"Casting full_input_features from {input_features.dtype} to model dtype {model_dtype}")
+                input_features = input_features.to(model_dtype)
+            if attention_mask is not None and attention_mask.device != self.target_device:
+                attention_mask = attention_mask.to(self.target_device)
+        except Exception as e:
+             warnings.warn(f"Could not move/cast input_features/attention_mask: {e}", RuntimeWarning)
+
+        generate_options = self._get_transcribe_kwargs(**kwargs)
+        final_language_to_report = generate_options.get("language", "en") 
+
         if current_call_verbose:
-            print(f"Calling ASR pipeline. Options: {pipeline_options}")
-            audio_duration = len(audio_input_for_pipeline) / SAMPLE_RATE if isinstance(audio_input_for_pipeline, np.ndarray) else "N/A (path input)"
-            print(f"Audio duration for pipeline: {audio_duration}s")
+            print(f"Calling self.model.generate() for full audio. Options: {generate_options}")
+            print(f"Model device: {self.model.device}, Input features: {input_features.shape}, {input_features.dtype}, {input_features.device}")
+            if attention_mask is not None: print(f"Attention mask: {attention_mask.shape}, {attention_mask.device}")
 
         full_text = ""
         segments_data = []
-        final_language_to_report = pipeline_options.get('language', "en")
 
-        try:
-            # The pipeline's __call__ method takes the audio and other parameters.
-            # generate_kwargs are passed to the underlying model.generate().
-            # Example: result = pipe(sample, generate_kwargs=generate_config, return_timestamps=True, chunk_length_s=30, stride_length_s=[4,2])
-            
-            # Prepare what to pass to pipeline __call__
-            call_args = {"inputs": audio_input_for_pipeline} # `inputs` is the ASR pipeline arg for audio
-            for key in ["chunk_length_s", "stride_length_s", "batch_size", "return_timestamps", "language", "task"]:
-                if key in pipeline_options:
-                    call_args[key] = pipeline_options[key]
-            if 'generate_kwargs' in pipeline_options:
-                call_args['generate_kwargs'] = pipeline_options['generate_kwargs']
+        with torch.no_grad():
+            try:
+                output = self.model.generate(
+                    input_features=input_features, 
+                    attention_mask=attention_mask,
+                    **generate_options 
+                )
 
-            output = self.asr_pipeline(**call_args)
-            
-            # Pipeline output is typically a dict with "text" and "chunks" (list of dicts)
-            # "chunks": [{"text": "...", "timestamp": (start_float, end_float)}, ...]
-            full_text = output.get("text", "").strip()
-            raw_chunks = output.get("chunks", [])
-
-            for i, chunk_data in enumerate(raw_chunks):
-                text = chunk_data.get("text", "").strip()
-                ts = chunk_data.get("timestamp", (None, None))
-                start_time = ts[0] if ts[0] is not None else 0.0
-                end_time = ts[1] if ts[1] is not None else start_time # If end is None, use start (can happen for very short utterances)
+                if self.target_device.type == "xpu":
+                    torch.xpu.synchronize()
                 
-                segments_data.append({
-                    "id": i, "seek": 0, # Seek is less relevant with pipeline's chunking
-                    "start": round(float(start_time), 3), "end": round(float(end_time), 3),
-                    "text": text, "tokens": [], # Pipeline doesn't typically return chunk tokens directly here
-                })
-            
-            # Language might be in the top-level output or info if detected
-            # final_language_to_report is already set from options, pipeline might update it if it detects.
+                predicted_ids = output.sequences if hasattr(output, "sequences") else output
+                full_text = self.processor.batch_decode(predicted_ids, skip_special_tokens=True)[0].strip()
+                
+                raw_segments = None
+                if hasattr(output, "segments") and output.segments is not None: raw_segments = output.segments
+                elif hasattr(output, "chunks") and output.chunks is not None: raw_segments = output.chunks
+                
+                if raw_segments and isinstance(raw_segments, list):
+                    for i, seg_data in enumerate(raw_segments):
+                        text = seg_data.get("text", "").strip()
+                        ts = seg_data.get("timestamp", (0.0, 0.0))
+                        start_time = ts[0] if isinstance(ts, (list, tuple)) and len(ts) > 0 else 0.0
+                        end_time = ts[1] if isinstance(ts, (list, tuple)) and len(ts) > 1 and ts[1] is not None else start_time 
+                        segments_data.append({
+                            "id": i, "seek": seg_data.get("seek", int(float(start_time) * SAMPLE_RATE / (HOP_LENGTH if 'HOP_LENGTH' in globals() and HOP_LENGTH > 0 else 160))), 
+                            "start": round(float(start_time), 3), "end": round(float(end_time), 3),
+                            "text": text, "tokens": seg_data.get("tokens", []),
+                        })
+                    if current_call_verbose: print(f"Extracted {len(segments_data)} segments from model output.")
+                elif full_text: 
+                    warnings.warn("Detailed segments not found. Creating single segment.", UserWarning)
+                    segments_data.append({
+                        "id": 0, "seek": 0, "start": 0.0, "end": round(audio_waveform.shape[0]/SAMPLE_RATE, 3), 
+                        "text": full_text, "tokens": predicted_ids.squeeze().tolist() if isinstance(predicted_ids, torch.Tensor) else []
+                    })
 
-            if current_call_verbose:
-                print(f"--- Transcription (Pipeline) ---")
-                print(f"Language: {final_language_to_report}") # This needs to be updated if pipeline detects
-                print(full_text)
-                # (Segment printing logic as before)
-                print(f"--- End Transcription (Pipeline) ---")
+                if hasattr(output, "language"): final_language_to_report = output.language
+                elif final_language_to_report is None: final_language_to_report = "en"
 
-        except Exception as e:
-            warnings.warn(f"Error during ASR pipeline execution: {e}", RuntimeWarning)
-            import traceback
-            traceback.print_exc()
-            return {"text": "", "segments": [], "language": final_language_to_report or "en"}
+                if current_call_verbose:
+                    print(f"--- Transcription ---")
+                    print(f"Language: {final_language_to_report}")
+                    print(full_text) # (Segment printing logic)
+                    print(f"--- End Transcription ---")
+
+            except Exception as e:
+                warnings.warn(f"Error during model.generate() or decoding: {e}", RuntimeWarning)
+                import traceback; traceback.print_exc()
+                final_lang_err = final_language_to_report if 'final_language_to_report' in locals() and final_language_to_report is not None else kwargs.get("language", "en")
+                return {"text": "", "segments": [], "language": final_lang_err}
         
-        return {
-            "text": full_text,
-            "segments": segments_data,
-            "language": final_language_to_report or "en"
-        }
+        final_lang_ret = final_language_to_report if 'final_language_to_report' in locals() and final_language_to_report is not None else kwargs.get("language", "en")
+        return {"text": full_text, "segments": segments_data, "language": final_lang_ret}
 
 
 class FasterWhisperTranscriber(Transcriber):
