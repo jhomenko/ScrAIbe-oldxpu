@@ -349,141 +349,141 @@ class OpenAIWhisperIPEXLLMTranscriber(Transcriber):
                     chunk.cpu().numpy(), 
                     sampling_rate=SAMPLE_RATE,
                     return_tensors="pt"
-                ).input_features
-                
-                # Get the model's dtype for consistent precision
+                ).input_features.to(torch.float32)  # Ensure input features are float32 initially
+            
+            # Get the model's dtype for consistent precision
+            model_dtype = next(self.model.parameters()).dtype
+            model_device = next(self.model.parameters()).device
+            
+            # Convert input features to match model's precision and device
+            try:
+                input_features = input_features.to(model_device, dtype=model_dtype)
+                if self.verbose:
+                    print(f"Input features converted to {model_dtype} on {model_device}")
+            except RuntimeError as e:
+                if "could not create an engine" in str(e) and model_device.type == "xpu":
+                    warnings.warn(f"XPU engine creation failed: {e}. Will try alternative approach.")
+                    # Try with explicit BFloat16 if model is using it
+                    if model_dtype == torch.bfloat16:
+                        try:
+                            input_features = input_features.to(model_device, dtype=torch.bfloat16)
+                            if self.verbose:
+                                print(f"Input features explicitly converted to BFloat16 on {model_device}")
+                        except RuntimeError:
+                            warnings.warn(f"Failed to convert input features to BFloat16 on XPU. Falling back to CPU.")
+                            input_features = input_features.to("cpu", dtype=torch.float32)
+                    else:
+                        warnings.warn(f"Falling back to CPU with float32.")
+                        input_features = input_features.to("cpu", dtype=torch.float32)
+                else:
+                    raise
+            
+            # Add initial prompt if specified and this is the first chunk
+            if initial_prompt and i == 0:
+                prompt_ids = self.processor.tokenizer.encode(initial_prompt, add_special_tokens=False)
+                prompt_ids = torch.tensor([prompt_ids], device=self.target_device)
+                generate_kwargs["decoder_input_ids"] = prompt_ids
+            
+            # Generate transcription
+            if self.verbose:
+                print(f"Processing chunk {i+1}/{num_chunks} ({chunk_start/SAMPLE_RATE:.2f}s - {chunk_end/SAMPLE_RATE:.2f}s)")
+            
+            # Try to generate with the model on its current device
+            try:
+                # Ensure input features match model dtype
                 model_dtype = next(self.model.parameters()).dtype
                 model_device = next(self.model.parameters()).device
                 
-                # Convert input features to match model's precision and device
-                try:
-                    input_features = input_features.to(model_device, dtype=model_dtype)
+                # Re-check and ensure input features match model dtype and device
+                if input_features.dtype != model_dtype or input_features.device != model_device:
                     if self.verbose:
-                        print(f"Input features converted to {model_dtype} on {model_device}")
-                except RuntimeError as e:
-                    if "could not create an engine" in str(e) and model_device.type == "xpu":
-                        warnings.warn(f"XPU engine creation failed: {e}. Will try alternative approach.")
-                        # Try with explicit BFloat16 if model is using it
+                        print(f"Re-aligning input features to {model_dtype} on {model_device}")
+                    input_features = input_features.to(model_device, dtype=model_dtype)
+                
+                # Generate with proper dtype alignment
+                generated_ids = self.model.generate(
+                    input_features,
+                    **generate_kwargs
+                )
+            except RuntimeError as e:
+                error_msg = str(e)
+                if "could not create an engine" in error_msg and model_device.type == "xpu":
+                    warnings.warn(f"XPU engine creation failed during generation: {e}. Will try alternative approach.")
+                    try:
+                        # Try with explicit BFloat16 if that's what the model is using
                         if model_dtype == torch.bfloat16:
-                            try:
-                                input_features = input_features.to(model_device, dtype=torch.bfloat16)
-                                if self.verbose:
-                                    print(f"Input features explicitly converted to BFloat16 on {model_device}")
-                            except RuntimeError:
-                                warnings.warn(f"Failed to convert input features to BFloat16 on XPU. Falling back to CPU.")
-                                input_features = input_features.to("cpu", dtype=torch.float32)
-                        else:
-                            warnings.warn(f"Falling back to CPU with float32.")
-                            input_features = input_features.to("cpu", dtype=torch.float32)
-                    else:
-                        raise
-                
-                # Add initial prompt if specified and this is the first chunk
-                if initial_prompt and i == 0:
-                    prompt_ids = self.processor.tokenizer.encode(initial_prompt, add_special_tokens=False)
-                    prompt_ids = torch.tensor([prompt_ids], device=self.target_device)
-                    generate_kwargs["decoder_input_ids"] = prompt_ids
-                
-                # Generate transcription
-                if self.verbose:
-                    print(f"Processing chunk {i+1}/{num_chunks} ({chunk_start/SAMPLE_RATE:.2f}s - {chunk_end/SAMPLE_RATE:.2f}s)")
-                
-                # Try to generate with the model on its current device
-                try:
-                    # Ensure input features match model dtype
-                    model_dtype = next(self.model.parameters()).dtype
-                    model_device = next(self.model.parameters()).device
-                    
-                    # Re-check and ensure input features match model dtype and device
-                    if input_features.dtype != model_dtype or input_features.device != model_device:
-                        if self.verbose:
-                            print(f"Re-aligning input features to {model_dtype} on {model_device}")
-                        input_features = input_features.to(model_device, dtype=model_dtype)
-                    
-                    # Generate with proper dtype alignment
-                    generated_ids = self.model.generate(
-                        input_features,
-                        **generate_kwargs
-                    )
-                except RuntimeError as e:
-                    error_msg = str(e)
-                    if "could not create an engine" in error_msg and model_device.type == "xpu":
-                        warnings.warn(f"XPU engine creation failed during generation: {e}. Will try alternative approach.")
-                        try:
-                            # Try with explicit BFloat16 if that's what the model is using
-                            if model_dtype == torch.bfloat16:
-                                if self.verbose:
-                                    print("Trying with explicit BFloat16 conversion")
-                                # Ensure all inputs are BFloat16
-                                input_features = input_features.to(model_device, dtype=torch.bfloat16)
-                                generated_ids = self.model.generate(
-                                    input_features,
-                                    **generate_kwargs
-                                )
-                            else:
-                                raise RuntimeError("Model is not using BFloat16, cannot apply BFloat16 workaround")
-                        except RuntimeError as e2:
-                            # If explicit BFloat16 also fails, try CPU fallback as last resort
-                            warnings.warn(f"XPU with explicit BFloat16 also failed: {e2}. Falling back to CPU as last resort.")
-                            # Move model to CPU
-                            self.model = self.model.to("cpu")
-                            # Ensure input features are on CPU with float32
-                            input_features = input_features.to("cpu", dtype=torch.float32)
-                            # Try again on CPU
+                            if self.verbose:
+                                print("Trying with explicit BFloat16 conversion")
+                            # Ensure all inputs are BFloat16
+                            input_features = input_features.to(model_device, dtype=torch.bfloat16)
                             generated_ids = self.model.generate(
                                 input_features,
                                 **generate_kwargs
                             )
-                    elif "Input type" in error_msg and "bias type" in error_msg and model_device.type == "xpu":
-                        # Handle type mismatch errors specifically
-                        warnings.warn(f"Type mismatch during generation: {e}. Trying to align types.")
-                        # Try to determine the required type from the error message
-                        if "BFloat16" in error_msg:
-                            if self.verbose:
-                                print("Error suggests BFloat16 is needed. Converting inputs.")
-                            input_features = input_features.to(model_device, dtype=torch.bfloat16)
-                        elif "Float16" in error_msg:
-                            if self.verbose:
-                                print("Error suggests Float16 is needed. Converting inputs.")
-                            input_features = input_features.to(model_device, dtype=torch.float16)
                         else:
-                            # Default to float32 if we can't determine the type
-                            if self.verbose:
-                                print("Using float32 as fallback precision.")
-                            input_features = input_features.to(model_device, dtype=torch.float32)
-                        
-                        # Try generation again with adjusted types
+                            raise RuntimeError("Model is not using BFloat16, cannot apply BFloat16 workaround")
+                    except RuntimeError as e2:
+                        # If explicit BFloat16 also fails, try CPU fallback as last resort
+                        warnings.warn(f"XPU with explicit BFloat16 also failed: {e2}. Falling back to CPU as last resort.")
+                        # Move model to CPU
+                        self.model = self.model.to("cpu")
+                        # Ensure input features are on CPU with float32
+                        input_features = input_features.to("cpu", dtype=torch.float32)
+                        # Try again on CPU
                         generated_ids = self.model.generate(
                             input_features,
                             **generate_kwargs
                         )
+                elif "Input type" in error_msg and "bias type" in error_msg and model_device.type == "xpu":
+                    # Handle type mismatch errors specifically
+                    warnings.warn(f"Type mismatch during generation: {e}. Trying to align types.")
+                    # Try to determine the required type from the error message
+                    if "BFloat16" in error_msg:
+                        if self.verbose:
+                            print("Error suggests BFloat16 is needed. Converting inputs.")
+                        input_features = input_features.to(model_device, dtype=torch.bfloat16)
+                    elif "Float16" in error_msg:
+                        if self.verbose:
+                            print("Error suggests Float16 is needed. Converting inputs.")
+                        input_features = input_features.to(model_device, dtype=torch.float16)
                     else:
-                        # For other errors, re-raise
-                        raise
-                
-                # Decode the generated ids
-                transcription = self.processor.batch_decode(
-                    generated_ids, 
-                    skip_special_tokens=True
-                )[0]
-                
-                # Calculate timestamps
-                chunk_start_time = chunk_start / SAMPLE_RATE
-                chunk_end_time = chunk_end / SAMPLE_RATE
-                
-                # Add to segments
-                all_segments.append({
-                    "id": i,
-                    "start": chunk_start_time,
-                    "end": chunk_end_time,
-                    "text": transcription,
-                    "temperature": generate_kwargs.get("temperature", 0.0),
-                    "avg_logprob": -99.0,  # Placeholder
-                    "compression_ratio": 0.0,  # Placeholder
-                    "no_speech_prob": 0.0,  # Placeholder
-                })
-                
-                full_text_parts.append(transcription)
+                        # Default to float32 if we can't determine the type
+                        if self.verbose:
+                            print("Using float32 as fallback precision.")
+                        input_features = input_features.to(model_device, dtype=torch.float32)
+                    
+                    # Try generation again with adjusted types
+                    generated_ids = self.model.generate(
+                        input_features,
+                        **generate_kwargs
+                    )
+                else:
+                    # For other errors, re-raise
+                    raise
+            
+            # Decode the generated ids
+            transcription = self.processor.batch_decode(
+                generated_ids, 
+                skip_special_tokens=True
+            )[0]
+            
+            # Calculate timestamps
+            chunk_start_time = chunk_start / SAMPLE_RATE
+            chunk_end_time = chunk_end / SAMPLE_RATE
+            
+            # Add to segments
+            all_segments.append({
+                "id": i,
+                "start": chunk_start_time,
+                "end": chunk_end_time,
+                "text": transcription,
+                "temperature": generate_kwargs.get("temperature", 0.0),
+                "avg_logprob": -99.0,  # Placeholder
+                "compression_ratio": 0.0,  # Placeholder
+                "no_speech_prob": 0.0,  # Placeholder
+            })
+            
+            full_text_parts.append(transcription)
         
         # Combine all transcriptions
         full_text = " ".join(full_text_parts)
@@ -631,7 +631,7 @@ if __name__ == '__main__':
         # For CPU, ipex-llm optimization still applies if use_ipex_llm=True (e.g., for bf16 on compatible CPUs)
         # but low_bit quantization might be more CPU-specific (e.g., sym_int8)
         openai_device = "xpu" if torch.xpu.is_available() and ipex_llm is not None else "cpu"
-        openai_low_bit = 'bf16' if openai_device == "xpu" else None # BF16 on XPU, no low-bit quant on CPU for this example
+        openai_low_bit = 'bf16' if openai_device == "xpu" else None # BF16
 
         transcriber_openai = load_transcriber(
             model_name="tiny", # Use a small model for quick testing
@@ -650,8 +650,6 @@ if __name__ == '__main__':
             print("Segments (first 3):")
             for seg in result_openai["segments"][:3]:
                 print(f"  ID {seg.get('id')}: [{seg.get('start',0):.2f}s -> {seg.get('end',0):.2f}s] {seg.get('text','N/A')}")
-        # transcriber_openai.save_transcript(result_openai, "openai_ipex_transcript.txt")
-
     except Exception as e:
         print(f"Error testing OpenAIWhisperIPEXLLMTranscriber: {e}")
         import traceback
