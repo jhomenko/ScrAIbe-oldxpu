@@ -55,7 +55,7 @@ class Scraibe:
 
     def __init__(self,
                  whisper_model: Union[str, Transcriber, None] = "medium",
-                 whisper_type: str = "openai-ipex-llm", # Only supports openai-ipex-llm now
+                 whisper_type: str = "whisper", # Only "whisper" (IPEX-LLM optimized) is supported now
                  dia_model: Union[str, Diariser, None] = None, # Configuration for the diarizer
                  target_device: Optional[Union[str, torch.device]] = None,
                  download_root: Optional[str] = None,
@@ -210,7 +210,7 @@ class Scraibe:
             dia_waveform = dia_waveform.to(dtype=torch.float32)
 
         dia_audio_input = {
-            "waveform": dia_waveform.to(active_diariser.device), # Use the actual device of the loaded diariser
+            "waveform": dia_waveform.to(self.target_device), # Use the Scraibe's target_device
             "sample_rate": audio_processor.sr
         }
         
@@ -298,7 +298,7 @@ class Scraibe:
             dia_waveform = dia_waveform.to(dtype=torch.float32)
 
         dia_audio_input = {
-            "waveform": dia_waveform.to(active_diariser.device), # Use device of loaded diariser
+            "waveform": dia_waveform.to(self.target_device), # Use the Scraibe's target_device
             "sample_rate": audio_processor.sr
         }
         if current_verbose: print("Starting diarisation (direct call)...")
