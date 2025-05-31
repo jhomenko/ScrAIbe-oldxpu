@@ -55,7 +55,7 @@ class Scraibe:
 
     def __init__(self,
                  whisper_model: Union[str, Transcriber, None] = "medium",
-                 whisper_type: str = "openai-ipex-llm",
+                 whisper_type: str = "faster-whisper",
                  dia_model: Union[str, Diariser, None] = None, # Configuration for the diarizer
                  target_device: Optional[Union[str, torch.device]] = None,
                  download_root: Optional[str] = None,
