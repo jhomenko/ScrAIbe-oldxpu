@@ -116,138 +116,124 @@ class OpenAIWhisperIPEXLLMTranscriber(Transcriber):
         # self.model, self.processor, self.verbose are set by super()
 
     @classmethod
-    def load_model(cls,
+    def load_model(cls, #... same arguments ...
                    model_name: str = "medium",
                    download_root: Optional[str] = None, 
                    device_option: Optional[Union[str, torch_device]] = None,
-                   # use_ipex_llm_specific_loader: bool = True, # We'll make this implicit based on low_bit
-                   low_bit: str = 'bf16', 
+                   low_bit: str = 'bf16', # Defaulting to bf16, but you'll test with fp32
                    use_auth_token: Optional[str] = None,
                    verbose: bool = False,
-                   **kwargs: Any 
+                   **kwargs: Any # Catches trust_remote_code, use_ipex_llm_specific_loader (though we might ignore this one now)
                    ) -> 'OpenAIWhisperIPEXLLMTranscriber':
-
-        # ... (target_device, hf_model_id mapping, processor loading - keep as is) ...
-        if ipex_llm is None and low_bit not in ["fp32", "bf16", "fp16", "float16", "none", ""]:
-            raise ImportError(f"IPEX-LLM library not found, cannot use it for low_bit='{low_bit}'. "
-                              "Only fp32/bf16/fp16 via base IPEX is possible.")
-        if ipex is None and target_device.type == 'xpu' and low_bit in ["fp32", "bf16", "fp16", "float16"]:
-            warnings.warn("Base Intel Extension for PyTorch (IPEX) not found. "
-                          "FP32/BF16/FP16 XPU optimization via ipex.optimize() will be skipped. Model will run as standard PyTorch on XPU.", UserWarning)
-
 
         target_device_str = str(device_option if device_option else SCRAIBE_TORCH_DEVICE)
         target_device = torch_device(target_device_str)
-        hf_model_id = model_name
-        official_short_names = ["tiny", "base", "small", "medium", "large", "large-v2", "large-v3"]
-        potential_short_name_base = model_name.split('.')[0]
-        if potential_short_name_base in official_short_names and "/" not in model_name:
-            hf_model_id = f"openai/whisper-{model_name}"
-            if verbose: print(f"Interpreted model_name '{model_name}' as Hugging Face ID '{hf_model_id}'")
+
+        hf_model_id = model_name # Assumes mapping to openai/whisper-small happened in CLI or is passed directly
+        if verbose: print(f"Attempting to load model '{hf_model_id}' with low_bit='{low_bit}' for device '{target_device_str}'")
+
         try:
-            processor = WhisperProcessor.from_pretrained(hf_model_id, cache_dir=download_root, token=use_auth_token)
+            processor = WhisperProcessor.from_pretrained(
+                hf_model_id, cache_dir=download_root, token=use_auth_token
+            )
         except Exception as e:
             warnings.warn(f"Failed to load WhisperProcessor for '{hf_model_id}': {e}", RuntimeWarning); raise
 
-
         model_instance = None
         normalized_low_bit = low_bit.lower() if isinstance(low_bit, str) else ""
-        
-        # --- Tiered Loading Strategy ---
-        # Path 1: Standard Transformers + base IPEX.optimize() for FP32/BF16/FP16 on XPU
+
+        # Determine loading strategy
+        use_ipex_llm_loader_for_int_quant = False
+        if normalized_low_bit in ["int4", "4bit", "sym_int4", "asym_int4", "woq_int4", "sym_int8"]:
+            if ipex_llm is not None:
+                use_ipex_llm_loader_for_int_quant = True
+            else:
+                warnings.warn(f"IPEX-LLM not found, cannot perform specified INT quantization '{low_bit}'. Falling back.", UserWarning)
+                normalized_low_bit = "fp32" # Fallback to fp32 if IPEX-LLM int quant is requested but lib not found
+
+        # Path 1: Standard Transformers + base IPEX.optimize() for FP32, BF16, FP16 on XPU
         if target_device.type == 'xpu' and ipex is not None and \
-           normalized_low_bit in ["fp32", "bf16", "fp16", "float16", "none", ""]:
+           (normalized_low_bit in ["fp32", "bf16", "fp16", "float16", "none", ""] or not use_ipex_llm_loader_for_int_quant):
             
-            torch_dtype_for_hf_load = torch.float32 # Default for "fp32", "none", ""
+            torch_dtype_for_hf_load = torch.float32 
             if normalized_low_bit == "bf16": torch_dtype_for_hf_load = torch.bfloat16
             elif normalized_low_bit == "fp16" or normalized_low_bit == "float16": torch_dtype_for_hf_load = torch.float16
             
-            if verbose: print(f"INFO: Attempting XPU path: Standard HF model '{hf_model_id}' (dtype: {torch_dtype_for_hf_load}) + ipex.optimize().")
+            if verbose: print(f"INFO: XPU Path: Loading standard HF model '{hf_model_id}' (dtype: {torch_dtype_for_hf_load}) then ipex.optimize().")
             try:
                 model_instance = WhisperForConditionalGeneration.from_pretrained(
                     hf_model_id,
                     torch_dtype=torch_dtype_for_hf_load,
-                    cache_dir=download_root,
-                    token=use_auth_token,
+                    cache_dir=download_root, token=use_auth_token,
                     trust_remote_code=kwargs.get('trust_remote_code', True)
                 )
-                model_instance = model_instance.eval().to(target_device) # Move to XPU before optimize
+                model_instance = model_instance.eval().to(target_device)
                 
-                # Apply cpu_embedding logic *manually* if needed for this path (more complex)
-                # For now, ipex.optimize will optimize the model as is on XPU.
-                if kwargs.get('cpu_embedding', False):
-                     warnings.warn("cpu_embedding=True is an IPEX-LLM specific loader flag and not directly applied "
-                                   "when using standard HF load + ipex.optimize(). Embeddings will be on XPU.", UserWarning)
+                # cpu_embedding for this path: IPEX optimize doesn't take it directly.
+                # If cpu_embedding=True was intended via CLI's component_kwargs, it's tricky to apply here.
+                # We are keeping embeddings on XPU for this ipex.optimize path.
+                if kwargs.get('cpu_embedding') and verbose:
+                     warnings.warn("cpu_embedding=True from kwargs is not directly applied with ipex.optimize(). Embeddings are on XPU.", UserWarning)
 
-                if verbose: print(f"INFO: Applying ipex.optimize(dtype={torch_dtype_for_hf_load}, weights_prepack=False) for XPU.")
+                if verbose: print(f"INFO: Applying ipex.optimize(dtype={torch_dtype_for_hf_load}, weights_prepack=False)")
                 model_instance = ipex.optimize(model_instance, dtype=torch_dtype_for_hf_load, inplace=True, weights_prepack=False)
-                # ipex.optimize with inplace=True should keep it on XPU if already moved.
             except Exception as e_hf_ipex:
-                warnings.warn(f"Standard HF + ipex.optimize() path failed for '{hf_model_id}', dtype {torch_dtype_for_hf_load}: {e_hf_ipex}", RuntimeWarning)
-                model_instance = None # Ensure fallback if this path fails
+                warnings.warn(f"Standard HF + ipex.optimize() path failed: {e_hf_ipex}", RuntimeWarning)
+                model_instance = None 
 
-        # Path 2: IPEX-LLM AutoModel loader (for INTx primarily, or as fallback for floats if Path 1 fails/not taken)
+        # Path 2: IPEX-LLM AutoModel loader (primarily for INTx, or if Path 1 failed/not taken for floats)
         if model_instance is None and ipex_llm is not None:
-            if verbose: print(f"INFO: Attempting model load via ipex_llm.transformers.AutoModelForSpeechSeq2Seq for low_bit='{low_bit}'")
+            if verbose: print(f"INFO: Fallback/INTx Path: Attempting load via ipex_llm.AutoModel for low_bit='{low_bit}'")
             from_pretrained_args = kwargs.copy()
             from_pretrained_args.update({
                 'trust_remote_code': from_pretrained_args.get('trust_remote_code', True),
                 'cache_dir': download_root, 'token': use_auth_token
             })
-            # cpu_embedding is an IPEX-LLM specific flag
-            if target_device.type == 'xpu':
-                # For INTx types, we found cpu_embedding=False (or not setting it to True) was better
-                if normalized_low_bit not in ["bf16", "fp16", "float16", "fp32", "none", ""]:
-                    from_pretrained_args['cpu_embedding'] = False # Explicitly false for INTx on XPU
-                    if verbose: print(f"INFO: Setting cpu_embedding=False for XPU with IPEX-LLM INTx loader.")
-                else: # For BF16/FP16 if this path is taken (e.g. CPU target, or IPEX was None for path 1)
-                    from_pretrained_args.setdefault('cpu_embedding', True)
-                    if verbose: print(f"INFO: Setting cpu_embedding=True for XPU with IPEX-LLM float loader.")
-
-
-            effective_torch_dtype = "auto"
+            
+            effective_torch_dtype_llm = "auto"
             if normalized_low_bit in ["int4", "4bit"]:
                 from_pretrained_args.update({'load_in_4bit': True, 'optimize_model': False})
-                effective_torch_dtype = None
-            else: # bf16, fp16, sym_int8, woq_int4 etc.
+                effective_torch_dtype_llm = None
+                if target_device.type == 'xpu': from_pretrained_args.setdefault('cpu_embedding', False) # Ensure embeddings on XPU for INT4
+            elif normalized_low_bit in ["sym_int8", "woq_int4"]: # Add other specific IPEX-LLM INT types
                 from_pretrained_args.update({'load_in_low_bit': low_bit, 'optimize_model': True})
-                if normalized_low_bit == "bf16": effective_torch_dtype = torch.bfloat16
-                elif normalized_low_bit == "fp16": effective_torch_dtype = torch.float16
-                else: effective_torch_dtype = None
+                effective_torch_dtype_llm = None
+                if target_device.type == 'xpu': from_pretrained_args.setdefault('cpu_embedding', False)
+            elif normalized_low_bit in ["bf16", "fp16", "float16"]: # If IPEX-LLM path taken for these
+                from_pretrained_args.update({'load_in_low_bit': low_bit, 'optimize_model': True})
+                if normalized_low_bit == "bf16": effective_torch_dtype_llm = torch.bfloat16
+                else: effective_torch_dtype_llm = torch.float16
+                if target_device.type == 'xpu': from_pretrained_args.setdefault('cpu_embedding', True)
+            # Omitting FP32 "none" "" path for IPEX-LLM AutoModel unless specific need
 
-            if effective_torch_dtype and effective_torch_dtype != "auto":
-                from_pretrained_args['torch_dtype'] = effective_torch_dtype
-            elif 'torch_dtype' in from_pretrained_args and effective_torch_dtype is None:
+            if effective_torch_dtype_llm and effective_torch_dtype_llm != "auto":
+                from_pretrained_args['torch_dtype'] = effective_torch_dtype_llm
+            elif 'torch_dtype' in from_pretrained_args and effective_torch_dtype_llm is None:
                  from_pretrained_args.pop('torch_dtype', None)
             
             if verbose: print(f"DEBUG: IPEX-LLM AutoModel .from_pretrained() args: {from_pretrained_args}")
             try:
                 model_instance = AutoModelForSpeechSeq2Seq.from_pretrained(hf_model_id, **from_pretrained_args)
             except Exception as e_ipex_llm_load:
-                warnings.warn(f"IPEX-LLM AutoModelForSpeechSeq2Seq load failed for '{hf_model_id}' with low_bit='{low_bit}': {e_ipex_llm_load}.", RuntimeWarning)
-                model_instance = None # Fall through if this fails
+                warnings.warn(f"IPEX-LLM AutoModel load failed: {e_ipex_llm_load}.", RuntimeWarning)
+                model_instance = None
 
-        # Path 3: Final fallback to standard Hugging Face model without any IPEX/IPEX-LLM specific optimization (e.g. for CPU fp32)
+        # Path 3: Final fallback (standard HF model, no IPEX/IPEX-LLM specific optimizations)
         if model_instance is None:
-            if verbose: print(f"INFO: All optimization paths failed or not applicable. Loading standard HF model '{hf_model_id}'.")
-            torch_dtype_final_fallback = torch.float32
-            if normalized_low_bit == "bf16" and target_device.type == 'cpu': # Check CPU BF16 support
-                 try: torch.zeros(1, dtype=torch.bfloat16) # Quick check
-                 except: torch_dtype_final_fallback = torch.float32; warnings.warn("BF16 not supported on CPU, using FP32.", UserWarning)
-                 else: torch_dtype_final_fallback = torch.bfloat16
-            elif normalized_low_bit == "fp16": torch_dtype_final_fallback = torch.float16 # For CPU, HF will likely use FP32 internally if needed
-
-            try:
+            # ... (your existing fallback logic to load standard WhisperForConditionalGeneration in FP32) ...
+             if verbose: print(f"INFO: All optimization paths failed/skipped. Loading standard HF model '{hf_model_id}' in FP32.")
+             try:
                 model_instance = WhisperForConditionalGeneration.from_pretrained(
-                    hf_model_id, torch_dtype=torch_dtype_final_fallback,
+                    hf_model_id, torch_dtype=torch.float32,
                     cache_dir=download_root, token=use_auth_token,
                     trust_remote_code=kwargs.get('trust_remote_code', True)
                 )
-            except Exception as e_final_fallback:
+             except Exception as e_final_fallback:
                  warnings.warn(f"Final fallback to standard HF model failed: {e_final_fallback}", RuntimeWarning)
                  raise RuntimeError(f"Could not load model {hf_model_id} through any method.") from e_final_fallback
 
 
+        # ... (Final model.eval(), .to(target_device), print, return cls(...) as before) ...
         model_instance = model_instance.eval()
         if model_instance.device != target_device and hasattr(model_instance, 'to'):
              model_instance = model_instance.to(target_device)
@@ -257,7 +243,7 @@ class OpenAIWhisperIPEXLLMTranscriber(Transcriber):
               f"Effective model dtype: {loaded_model_dtype}. Low-bit request: '{low_bit}'.")
         
         return cls(hf_model_id, model_instance, processor, model_instance.device, low_bit_format=low_bit, verbose=verbose)
-        
+
     def _get_transcribe_kwargs(self, **kwargs: Any) -> Dict[str, Any]:
         # This is the _get_transcribe_kwargs from your last version, which aims to pass appropriate
         # parameters to the model's internal long-form generate.
