@@ -4,7 +4,7 @@ Scraibe Class
 
 This class serves as the core of the transcription system, responsible for handling
 transcription and diarization of audio files. It leverages pretrained models for
-speech-to-text (such as Whisper) and speaker diarization (such as pyannote.audio),
+speech-to-text (Whisper with IPEX-LLM optimization) and speaker diarization (such as pyannote.audio),
 providing an accessible interface for audio processing tasks such as transcription,
 speaker separation, and timestamping.
 
@@ -55,7 +55,7 @@ class Scraibe:
 
     def __init__(self,
                  whisper_model: Union[str, Transcriber, None] = "medium",
-                 whisper_type: str = "openai-ipex-llm",
+                 whisper_type: str = "openai-ipex-llm", # Only supports openai-ipex-llm now
                  dia_model: Union[str, Diariser, None] = None, # Configuration for the diarizer
                  target_device: Optional[Union[str, torch.device]] = None,
                  download_root: Optional[str] = None,

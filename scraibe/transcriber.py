@@ -8,7 +8,6 @@ and saving transcriptions to text files. It acts as an interface between various
 simplifying the process of audio transcription.
 
 Main Features:
-    - Loading different sizes and versions of Whisper models (OpenAI, FasterWhisper).
     - Support for IPEX-LLM optimization for OpenAI Whisper models on Intel XPUs.
     - Transcribing audio in various formats including str, Tensor, and ndarray.
     - Saving the transcriptions to the specified paths.
@@ -29,16 +28,6 @@ Usage:
     ... )
     >>> result_ipex = transcriber_ipex.transcribe(audio="path/to/audio.wav")
     >>> print(result_ipex["text"])
-    >>>
-    >>> # For FasterWhisper
-    >>> transcriber_faster = load_transcriber(
-    ...     model_name="tiny",
-    ...     whisper_type="faster-whisper",
-    ...     device="cpu", # or "cuda"
-    ...     compute_type="int8"
-    ... )
-    >>> result_faster = transcriber_faster.transcribe(audio="path/to/audio.wav")
-    >>> print(result_faster["text"])
 """
 
 from abc import ABC, abstractmethod
@@ -50,42 +39,28 @@ import torch
 from torch import Tensor, device
 from numpy import ndarray
 import warnings
-import numpy as np # For FasterWhisper audio conversion if needed
+import numpy as np
 
 # OpenAI Whisper imports
-from whisper import Whisper as OpenAIWhisperModel # Renamed for clarity
-from whisper import load_model as openai_whisper_load_model # Renamed
-from whisper.tokenizer import TO_LANGUAGE_CODE as OPENAI_WHISPER_TO_LANGUAGE_CODE # Renamed
+from whisper.tokenizer import TO_LANGUAGE_CODE
 
 from ipex_llm.transformers import AutoModelForSpeechSeq2Seq
-from transformers import WhisperProcessor
+from transformers import WhisperProcessor, pipeline
+from transformers.pipelines.pt_utils import PipelineIterator
 
-# FasterWhisper imports
-from faster_whisper import WhisperModel as FasterWhisperModel
-from faster_whisper.tokenizer import _LANGUAGE_CODES as FASTER_WHISPER_LANGUAGE_CODES
-
-# --- Define Whisper constants (adapted from openai-whisper/whisper/audio.py) ---
-# These are typically derived from the model's config or feature_extractor,
-# but defining them explicitly based on Whisper standards for clarity in this port.
-# Ensure these match your loaded model/processor if they differ.
+# --- Define Whisper constants ---
 SAMPLE_RATE = 16000
-N_FFT = 400
-HOP_LENGTH = 160 # self.processor.feature_extractor.hop_length
 CHUNK_LENGTH = 30 # seconds
-N_SAMPLES_PER_CHUNK = CHUNK_LENGTH * SAMPLE_RATE # 480000
-N_FRAMES_PER_CHUNK = N_SAMPLES_PER_CHUNK // HOP_LENGTH # 3000 frames for a 30-second window
-# N_MELS = 80 # self.processor.feature_extractor.feature_size or self.model.config.num_mel_bins
 
-# For token context
-# MAX_TEXT_TOKEN_LENGTH = 448 # self.model.config.max_length or similar for decoder
-
-# IPEX-LLM import (optional)
+# IPEX-LLM import
 try:
     import ipex_llm
+    import intel_extension_for_pytorch as ipex
     print("INFO: IPEX-LLM library found.")
 except ImportError:
     ipex_llm = None
-    print("WARNING: IPEX-LLM library not found. IPEX-LLM specific optimizations will not be available for OpenAI Whisper.")
+    ipex = None
+    print("WARNING: IPEX-LLM library not found. IPEX-LLM specific optimizations will not be available for Whisper.")
 
 # Local project imports (assuming these exist in scraibe.misc)
 try:
@@ -302,268 +277,137 @@ class OpenAIWhisperIPEXLLMTranscriber(Transcriber):
 
         return cls(hf_model_id, model_instance, processor, target_device, low_bit_format=low_bit)
 
-    def _pad_or_trim_features(self, features: torch.Tensor, length: int = N_FRAMES_PER_CHUNK) -> torch.Tensor:
-        """Pads or trims the input mel spectrogram features to a specified length."""
-        if features.shape[-1] > length:
-            features = features[..., :length]
-        elif features.shape[-1] < length:
-            padding = length - features.shape[-1]
-            features = torch.nn.functional.pad(features, (0, padding))
-        return features
+    @property
+    def pipeline(self):
+        """
+        Lazy initialization of the pipeline to ensure it's only created when needed.
+        """
+        if not hasattr(self, '_pipeline') or self._pipeline is None:
+            if self.verbose:
+                print(f"Creating ASR pipeline with model on {self.target_device}")
+            
+            # Get model dtype for proper input feature conversion
+            model_dtype = next(self.model.parameters()).dtype
+            
+            # Create the pipeline
+            self._pipeline = pipeline(
+                "automatic-speech-recognition",
+                model=self.model,
+                tokenizer=self.processor.tokenizer,
+                feature_extractor=self.processor.feature_extractor,
+                max_new_tokens=128,
+                chunk_length_s=CHUNK_LENGTH,  # 30 second chunks with proper padding
+                batch_size=16,  # Process in batches for GPU efficiency
+                return_timestamps=True,  # Important for diarisation
+                torch_dtype=model_dtype,
+                device=self.target_device
+            )
+            
+            # Apply the fix for low-bit quantization
+            # Monkey patch the pipeline's preprocess method to ensure input features are cast to the right dtype
+            original_preprocess = self._pipeline.preprocess
+            
+            def preprocess_with_dtype_fix(*args, **kwargs):
+                # Call the original preprocess method
+                batch = original_preprocess(*args, **kwargs)
+                
+                # Apply the fix for low-bit quantization by casting to model dtype
+                if "input_features" in batch:
+                    batch["input_features"] = batch["input_features"].to(dtype=model_dtype)
+                
+                return batch
+            
+            self._pipeline.preprocess = preprocess_with_dtype_fix
+            
+        return self._pipeline
 
     def transcribe(self, audio: Union[str, torch.Tensor, np.ndarray], **kwargs: Any) -> Dict[str, Any]:
         """
-        Transcribe long audio files using a windowed approach on the raw audio waveform,
-        with the IPEX-LLM loaded Whisper model.
+        Transcribe audio using the IPEX-LLM optimized Whisper model with pipeline approach.
+        This implementation properly chunks audio with padding on either side and processes
+        in batches to make full use of the GPU.
         """
         if not self.processor or not self.model:
             raise RuntimeError("Transcriber is not properly initialized with a model and processor.")
 
         self.verbose = kwargs.get("verbose", self.verbose)
-
-        # ---- Parameter Setup from kwargs ----
-        temperature_option = kwargs.get("temperature", (0.0, 0.2, 0.4, 0.6, 0.8, 1.0))
-        temperatures = (temperature_option,) if isinstance(temperature_option, (float, int)) else tuple(temperature_option)
-        condition_on_previous_text = kwargs.get("condition_on_previous_text", True)
-        initial_prompt_str = kwargs.get("initial_prompt")
-        # For simplicity, full support for logprob_threshold, compression_ratio_threshold, no_speech_threshold
-        # in fallback logic is omitted but can be added if needed by analyzing generate output.
+        language = kwargs.get("language", "en")
+        task = kwargs.get("task", "transcribe")
+        initial_prompt = kwargs.get("initial_prompt")
         
-        generate_args_base = self._get_transcribe_kwargs(**kwargs) # Get common generate() args
-        generate_args_base.setdefault('use_cache', True)
-        # Remove temperature from base, as it's handled in the loop
-        generate_args_base.pop('temperature', None)
-
-
-        # ---- Audio Preprocessing: Ensure waveform is 1D float32 tensor ----
+        # Set language and task
+        if language and task:
+            self.pipeline.model.config.forced_decoder_ids = self.processor.get_decoder_prompt_ids(
+                language=language, task=task
+            )
+        
+        # Process the audio
         if isinstance(audio, str):
             raise NotImplementedError("This transcribe method expects a waveform Tensor. Path loading should be handled by Scraibe.")
-        elif isinstance(audio, np.ndarray):
-            audio_waveform = torch.from_numpy(audio.astype(np.float32))
-        elif isinstance(audio, torch.Tensor):
-            audio_waveform = audio.to(torch.float32)
         else:
-            raise TypeError(f"Expected audio to be str, Tensor, or ndarray, but got {type(audio)}")
-
-        if audio_waveform.ndim > 1: audio_waveform = audio_waveform.squeeze()
-        if audio_waveform.ndim != 1: raise ValueError(f"Audio waveform must be 1D, got {audio_waveform.ndim} dims.")
-
-        # ---- Language and Task Setup ----
-        language = kwargs.get("language", "en") # Default to 'en'
-        task = kwargs.get("task", "transcribe")
+            # Handle tensor or ndarray input
+            if isinstance(audio, np.ndarray):
+                audio_tensor = torch.from_numpy(audio.astype(np.float32))
+            else:
+                audio_tensor = audio.to(torch.float32)
+            
+            if audio_tensor.ndim > 1:
+                audio_tensor = audio_tensor.squeeze()
+            
+            if self.verbose:
+                print(f"Processing audio with shape {audio_tensor.shape}, using pipeline with chunk_length_s={CHUNK_LENGTH}")
+            
+            # Process with pipeline
+            pipeline_kwargs = {
+                "return_timestamps": True,
+            }
+            
+            if initial_prompt:
+                pipeline_kwargs["prompt"] = initial_prompt
+                
+            generate_kwargs = {"language": language} if language else {}
+            
+            result = self.pipeline(
+                {"array": audio_tensor.cpu().numpy(), "sampling_rate": SAMPLE_RATE}, 
+                generate_kwargs=generate_kwargs,
+                **pipeline_kwargs
+            )
         
-        # If language is not specified, robust detection requires a call to generate on the first chunk.
-        # This is complex to integrate here seamlessly without seeing the generated language token.
-        # For now, this implementation will rely on the provided 'language' or the model's default if 'language' is None
-        # when passed to processor.get_decoder_prompt_ids.
-        # The `openai-whisper` `transcribe` function has a dedicated `model.detect_language` call.
-        if language is None and self.model.config.is_multilingual:
-             if self.verbose: print("Language not specified. Relying on model's multilingual capability for first chunk, or processor default.")
-             # For more robust auto-detection, one would run a short `generate` on the first chunk
-             # with a generic prompt and inspect the predicted language token.
-             # This is omitted here for initial simplicity. Language will be what's used in the prompt.
-
-        # ---- Tokenizer & Prompt Setup ----
-        all_tokens: List[int] = []
-        all_segments: List[Dict[str, Any]] = []
-        prompt_reset_since = 0
-
-        if initial_prompt_str:
-            try:
-                initial_prompt_tokens = self.processor.tokenizer.encode(" " + initial_prompt_str.strip())
-                all_tokens.extend(initial_prompt_tokens)
-            except Exception as e_prompt:
-                warnings.warn(f"Could not encode initial_prompt: {e_prompt}", UserWarning)
-
-
-        # ---- Main Transcription Loop (Windowing over raw audio samples) ----
-        num_samples_total = audio_waveform.shape[0]
-        seek_samples = 0 # Current position in audio_waveform samples
-
-        # Use CHUNK_LENGTH (30s) and N_SAMPLES_PER_CHUNK for windowing the audio waveform
-        with tqdm.tqdm(total=num_samples_total, unit="samples", disable=not self.verbose, desc="Transcribing Audio Chunks") as pbar:
-            while seek_samples < num_samples_total:
-                time_offset = float(seek_samples / SAMPLE_RATE)
-                
-                # Get the current audio chunk from the waveform
-                current_audio_chunk_waveform = audio_waveform[seek_samples : seek_samples + N_SAMPLES_PER_CHUNK]
-
-                # Process this chunk to get input_features
-                try:
-                    chunk_input_features = self.processor(
-                        current_audio_chunk_waveform.cpu().numpy(),
-                        sampling_rate=SAMPLE_RATE,
-                        return_tensors="pt"
-                    ).input_features # This should produce features for up to 30s, padded/trimmed to N_FRAMES_PER_CHUNK
-                except Exception as e_proc:
-                    warnings.warn(f"Error processing audio chunk at {time_offset:.2f}s: {e_proc}", RuntimeWarning)
-                    seek_samples += N_SAMPLES_PER_CHUNK # Skip this chunk
-                    pbar.update(N_SAMPLES_PER_CHUNK)
-                    continue
-
-                # Ensure features are on the target device and correct dtype
-                model_dtype = next(self.model.parameters()).dtype
-                if chunk_input_features.device != self.target_device:
-                    chunk_input_features = chunk_input_features.to(self.target_device)
-                if chunk_input_features.dtype != model_dtype:
-                    chunk_input_features = chunk_input_features.to(model_dtype)
-                
-                # The feature extractor should already pad/trim to N_FRAMES_PER_CHUNK.
-                # If not, self._pad_or_trim_features(chunk_input_features) would be needed here.
-
-                # Prepare decoder_input_ids (prompt for the current segment)
-                prompt_tokens_for_current_segment: List[int] = []
-                try:
-                    # Get base prompt (SOT, lang, task)
-                    # Use the 'language' determined/passed for the whole transcription for consistency here
-                    decoder_prompt_list_of_lists = self.processor.get_decoder_prompt_ids(language=language, task=task, no_timestamps=True)
-                    if decoder_prompt_list_of_lists and decoder_prompt_list_of_lists[0] is not None:
-                        prompt_tokens_for_current_segment = list(decoder_prompt_list_of_lists[0])
-                    else:
-                        prompt_tokens_for_current_segment = [self.processor.tokenizer.sot_token_id] # Minimal
-                except Exception as e_dec_prompt:
-                    warnings.warn(f"Error getting decoder prompt ids for lang {language}, task {task}: {e_dec_prompt}. Using minimal SOT.", UserWarning)
-                    prompt_tokens_for_current_segment = [self.processor.tokenizer.sot_token_id]
-
-                if condition_on_previous_text:
-                    max_prompt_len = self.model.config.max_length // 2 - len(prompt_tokens_for_current_segment) -1 # Approximate
-                    max_prompt_len = max(0, max_prompt_len) # Ensure non-negative
-                    
-                    # Use tokens from `all_tokens` (which accumulates generated content tokens)
-                    previous_content_tokens = all_tokens[prompt_reset_since:]
-                    prompt_tokens_for_current_segment.extend(previous_content_tokens[-max_prompt_len:])
-
-                decoder_input_ids = torch.tensor([prompt_tokens_for_current_segment], device=self.target_device).long()
-
-                segment_generated_text = ""
-                segment_tokens_full_output = [] # To store full output tokens of this segment
-                
-                generated_successfully_this_segment = False
-                last_used_temperature = temperatures[0]
-
-                for temp_idx, temp in enumerate(temperatures):
-                    current_generate_args = generate_args_base.copy()
-                    current_generate_args['temperature'] = temp
-
-                    if temp == 0.0 and not current_generate_args.get('do_sample', False): # Greedy
-                        current_generate_args.pop('temperature', None) # Transformers might warn if temp=0 and do_sample=False
-                        current_generate_args['do_sample'] = False
-                        current_generate_args.setdefault('num_beams', 1) # Ensure greedy
-                    elif temp > 0: # Sampling
-                        current_generate_args['do_sample'] = True
-                        current_generate_args.pop("num_beams", None)
-                    else: # temp == 0.0 and num_beams > 1 (Beam search)
-                         current_generate_args['do_sample'] = False
-                         current_generate_args.setdefault('num_beams', generate_args_base.get('num_beams',5))
-
-
-                    if self.verbose and len(temperatures) > 1:
-                        pbar.set_description_str(f"Transcribing (seek {seek_samples/SAMPLE_RATE:.1f}s, temp {temp:.1f})")
-
-                    try:
-                        predicted_ids_segment = self.model.generate(
-                            chunk_input_features,
-                            decoder_input_ids=decoder_input_ids,
-                            **current_generate_args
-                        )
-                        if self.target_device.type == "xpu": torch.xpu.synchronize()
-
-                        start_of_generation_idx = decoder_input_ids.shape[1]
-                        
-                        # Get only the newly generated tokens
-                        segment_tokens_generated_part = predicted_ids_segment[0, start_of_generation_idx:].tolist()
-                        
-                        segment_generated_text = self.processor.batch_decode(
-                            predicted_ids_segment[:, start_of_generation_idx:],
-                            skip_special_tokens=True
-                        )[0].strip()
-                        
-                        segment_tokens_full_output = predicted_ids_segment[0].tolist()
-
-                        # Simplified success criteria: if any text is generated.
-                        # TODO: Add more robust checks like logprob, compression, no_speech from original.
-                        if segment_generated_text: # Basic check
-                            generated_successfully_this_segment = True
-                            last_used_temperature = temp
-                            break 
-                        elif temp_idx == len(temperatures) - 1: # Last temperature, still no text
-                            if self.verbose: print(f"Segment at {time_offset:.2f}s produced no text after all temperatures.")
-                            generated_successfully_this_segment = True # Consider it "handled"
-                            last_used_temperature = temp
-                            break
-
-
-                    except Exception as e_gen:
-                        warnings.warn(f"Error during segment generation at {time_offset:.2f}s (temp {temp:.1f}): {e_gen}", RuntimeWarning)
-                        if temp_idx == len(temperatures) - 1: # Last temperature also failed
-                            segment_generated_text = f"[ERROR: Generation failed for segment at {time_offset:.2f}s]"
-                            segment_tokens_full_output = prompt_tokens_for_current_segment + [self.processor.tokenizer.eos_token_id]
-                            generated_successfully_this_segment = True # Mark as "handled"
-                            last_used_temperature = temp
-                
-                if not generated_successfully_this_segment: # Should be handled by last temp fallback
-                     segment_generated_text = f"[ERROR: All temperatures failed for segment at {time_offset:.2f}s]"
-                     segment_tokens_full_output = prompt_tokens_for_current_segment + [self.processor.tokenizer.eos_token_id]
-
-
-                # For simplicity, segment times are chunk boundaries.
-                # Original Whisper extracts precise timestamps from tokens if available.
-                # This requires decoding timestamp tokens, which is omitted here.
-                chunk_duration = current_audio_chunk_waveform.shape[0] / SAMPLE_RATE
-                segment_end_time = time_offset + chunk_duration
-                
-                all_segments.append({
-                    "id": len(all_segments),
-                    "seek": seek_samples, # seek in samples from start of audio
-                    "start": time_offset,
-                    "end": segment_end_time,
-                    "text": segment_generated_text,
-                    "tokens": segment_tokens_full_output, # Full output tokens for this segment
-                    "temperature": last_used_temperature,
-                    # Placeholders for metrics not easily available from HF generate
-                    "avg_logprob": -99.0, "compression_ratio": 0.0, "no_speech_prob": 0.0,
+        # Format the result to match the expected output format
+        segments = []
+        
+        # Check if we have chunks with timestamps
+        if "chunks" in result:
+            for i, chunk in enumerate(result["chunks"]):
+                segments.append({
+                    "id": i,
+                    "start": chunk.get("timestamp", [0, 0])[0],
+                    "end": chunk.get("timestamp", [0, 0])[1],
+                    "text": chunk.get("text", ""),
+                    # Add additional fields to match the original format
+                    "temperature": 0.0,  # Default value
+                    "avg_logprob": -99.0,  # Placeholder
+                    "compression_ratio": 0.0,  # Placeholder
+                    "no_speech_prob": 0.0,  # Placeholder
                 })
-                if self.verbose:
-                     print(f"[{time_offset:07.3f} --> {segment_end_time:07.3f}] {segment_generated_text}")
-
-                # Add only the newly generated part to all_tokens for conditioning next prompt
-                # This part needs to be careful about what `segment_tokens_generated_part` contains
-                # (e.g., does it include EOT or other control tokens that should be stripped before appending?)
-                # For robust conditioning, only actual content tokens should be added.
-                # The original `all_tokens.extend([token for segment in current_segments for token in segment["tokens"]])`
-                # used the full output tokens. Let's use our `segment_tokens_generated_part`.
-                
-                # We need to get content tokens from segment_tokens_generated_part
-                content_tokens_for_prompt = [
-                    tok for tok in segment_tokens_generated_part 
-                    if tok < self.processor.tokenizer.eos_token_id # Basic filter for content
-                ]
-                all_tokens.extend(content_tokens_for_prompt)
-
-                if not condition_on_previous_text or last_used_temperature > 0.5:
-                    prompt_reset_since = len(all_tokens)
-
-                seek_samples += N_SAMPLES_PER_CHUNK
-                pbar.update(N_SAMPLES_PER_CHUNK if seek_samples <= num_samples_total else num_samples_total - (seek_samples - N_SAMPLES_PER_CHUNK) )
+        else:
+            # If no chunks with timestamps, create a single segment
+            duration = len(audio_tensor) / SAMPLE_RATE if isinstance(audio_tensor, torch.Tensor) else 0
+            segments.append({
+                "id": 0,
+                "start": 0.0,
+                "end": duration,
+                "text": result.get("text", ""),
+                "temperature": 0.0,
+                "avg_logprob": -99.0,
+                "compression_ratio": 0.0,
+                "no_speech_prob": 0.0,
+            })
         
-        final_text = self.processor.tokenizer.decode(all_tokens, skip_special_tokens=True).strip()
-        
-        # Language determination logic:
-        # If 'language' was initially None, the model might have predicted it in the first chunk.
-        # This simplified version uses the 'language' argument passed or defaulted.
-        # A more robust version would inspect the first segment's tokens for a language token.
-        final_determined_language = language if language is not None else "en" # Fallback
-        if language is None and all_segments and "tokens" in all_segments[0]:
-            first_segment_tokens = all_segments[0]["tokens"]
-            # Try to infer language from first segment tokens (this is complex)
-            # For example, look for language token after SOT if model is multilingual
-            # This is a placeholder for a proper language identification from tokens
-            pass 
-
         return {
-            "text": final_text,
-            "segments": all_segments,
-            "language": final_determined_language
+            "text": result.get("text", ""),
+            "segments": segments,
+            "language": language
         }
 
 
@@ -626,200 +470,35 @@ class OpenAIWhisperIPEXLLMTranscriber(Transcriber):
         # forced_decoder_ids is handled by passing decoder_input_ids in the main transcribe loop
         generate_params.pop('forced_decoder_ids', None)
         
-        # Max new tokens: Whisper segments are ~30s. Max tokens for that is ~N_FRAMES_PER_CHUNK / 2
+        # Max new tokens: Whisper segments are ~30s. 
         # This should be a sensible default if not provided.
         # self.model.config.max_length is for the *entire* sequence (prompt + generation).
         # For generate, max_new_tokens or max_length (as total) is more relevant for a chunk.
-        generate_params.setdefault('max_new_tokens', N_FRAMES_PER_CHUNK // 2) # Approx max tokens for 30s chunk
+        generate_params.setdefault('max_new_tokens', 1500) # Approx max tokens for 30s chunk
 
         return generate_params
-
-
-# Ensure your FasterWhisperTranscriber and load_transcriber factory function are still in this file
-# The load_transcriber factory will need to call this new version of 
-# OpenAIWhisperIPEXLLMTranscriber.load_model correctly.
-# The existing call in load_transcriber:
-#   return OpenAIWhisperIPEXLLMTranscriber.load_model(
-#       model_name=model_name,
-#       download_root=download_root,
-#       device_option=target_device, # This 'device_option' is the param name in the new load_model
-#       **kwargs # kwargs here are from load_transcriber's **kwargs
-#                # which are from Scraibe.__init__'s component_kwargs.
-#                # These include `low_bit`, `use_ipex_llm`, `use_auth_token`.
-#   )
-# This call structure should still be compatible with the refactored class method.
-
-class FasterWhisperTranscriber(Transcriber):
-    """
-    Transcriber for FasterWhisper models.
-    """
-    def __init__(self, model_name: str, model_instance: FasterWhisperModel) -> None:
-        super().__init__(model_name, model_instance)
-
-    @classmethod
-    def load_model(cls,
-                   model_name: str = "medium",
-                   download_root: Optional[str] = WHISPER_DEFAULT_PATH,
-                   device_option: Optional[Union[str, torch.device]] = SCRAIBE_TORCH_DEVICE,
-                   # FasterWhisper specific arguments
-                   compute_type: str = "default", # Default for FasterWhisper e.g. "int8", "float16", "auto"
-                   cpu_threads: int = SCRAIBE_NUM_THREADS,
-                   num_workers: int = 1,
-                   **kwargs: Any
-                   ) -> 'FasterWhisperTranscriber':
-
-        target_device_str = str(device_option if device_option else SCRAIBE_TORCH_DEVICE).lower()
-        
-        # Determine device and compute_type for FasterWhisper
-        actual_fw_device = "cpu" # FasterWhisper's device argument ("cpu", "cuda", "auto")
-        effective_compute_type = compute_type
-
-        if "cuda" in target_device_str:
-            actual_fw_device = "cuda"
-            if effective_compute_type == "default": effective_compute_type = "float16"
-        elif "xpu" in target_device_str:
-            # FasterWhisper on XPU typically implies using OpenVINO backend via device="cpu"
-            actual_fw_device = "cpu"
-            if effective_compute_type == "default": effective_compute_type = "int8" # Good OpenVINO default
-            warnings.warn(f"FasterWhisper on XPU: setting device to 'cpu' (for OpenVINO backend). Compute type: '{effective_compute_type}'.")
-        else: # CPU
-            actual_fw_device = "cpu"
-            if effective_compute_type == "default": effective_compute_type = "int8"
-        
-        if actual_fw_device == 'cpu' and effective_compute_type == 'float16':
-            warnings.warn(f"Compute type 'float16' with device 'cpu' for FasterWhisper may not be optimal. Consider 'int8' or 'auto'. Using '{effective_compute_type}'.")
-
-        _model = FasterWhisperModel(model_size_or_path=model_name, # `model_size_or_path` is the arg
-                                    download_root=download_root,
-                                    device=actual_fw_device,
-                                    compute_type=effective_compute_type,
-                                    cpu_threads=cpu_threads,
-                                    num_workers=num_workers)
-        return cls(model_name, _model)
-
-    def transcribe(self, audio: Union[str, Tensor, ndarray], **kwargs: Any) -> Dict[str, Any]:
-        """
-        Transcribe using the FasterWhisper model.
-        """
-        processed_audio = audio
-        if isinstance(audio, Tensor):
-            processed_audio = audio.cpu().numpy().astype(np.float32)
-        elif isinstance(audio, np.ndarray):
-            processed_audio = audio.astype(np.float32)
-        # If str, FasterWhisper handles path directly
-
-        transcribe_kwargs = self._get_transcribe_kwargs(**kwargs)
-        
-        segments_iterable, info = self.model.transcribe(processed_audio, **transcribe_kwargs)
-        
-        full_text_parts = []
-        segments_data = []
-        for i, seg in enumerate(segments_iterable):
-            segment_text = seg.text.strip()
-            full_text_parts.append(segment_text)
-            segments_data.append({
-                "id": i, 
-                "start": round(seg.start, 3), 
-                "end": round(seg.end, 3), 
-                "text": segment_text,
-                "tokens": seg.tokens,
-                "temperature": seg.temperature,
-                "avg_logprob": seg.avg_logprob,
-                "compression_ratio": seg.compression_ratio,
-                "no_speech_prob": seg.no_speech_prob,
-                # Include seek if available, though not standard in segment object
-            })
-        
-        full_text = " ".join(full_text_parts).strip()
-        return {
-            "text": full_text,
-            "segments": segments_data,
-            "language": info.language,
-            "language_probability": info.language_probability,
-            "duration_after_vad": getattr(info, "duration_after_vad", None), # If VAD used
-            "transcription_time": getattr(info, "transcription_time", None) # If info provides it
-        }
-
-    @staticmethod
-    def _get_transcribe_kwargs(**kwargs: Any) -> Dict[str, Any]:
-        """
-        Prepare keyword arguments for FasterWhisper's `transcribe` method.
-        """
-        # signature(FasterWhisperModel.transcribe).parameters.keys() is a good way,
-        # but let's list common ones for clarity and to avoid issues if signature changes.
-        known_faster_options = [
-            "language", "task", "beam_size", "best_of", "patience", "length_penalty",
-            "repetition_penalty", "no_repeat_ngram_size", "temperature", "compression_ratio_threshold",
-            "log_prob_threshold", "no_speech_threshold", "condition_on_previous_text",
-            "initial_prompt", "prefix", "suppress_blank", "suppress_tokens",
-            "without_timestamps", "max_initial_timestamp", "word_timestamps", "vad_filter",
-            "vad_parameters", "chunk_length" # FasterWhisper specific
-        ]
-        
-        final_kwargs = {k: v for k, v in kwargs.items() if k in known_faster_options}
-
-        if (language := kwargs.get("language")): # Ensure language code conversion if a name is passed
-            try:
-                final_kwargs["language"] = FasterWhisperTranscriber.convert_to_language_code(language)
-            except ValueError as e:
-                warnings.warn(str(e) + " Language will not be set for FasterWhisper.")
-                if "language" in final_kwargs: del final_kwargs["language"]
-        
-        return final_kwargs
-
-    @staticmethod
-    def convert_to_language_code(lang_input: str) -> str:
-        """
-        Convert a language name (e.g., "english") or code (e.g., "en")
-        to a language code recognized by FasterWhisper.
-        """
-        if not lang_input: # Handle empty or None lang_input
-            return None # FasterWhisper will auto-detect
-
-        lang_input_lower = lang_input.lower().strip()
-        if lang_input_lower in FASTER_WHISPER_LANGUAGE_CODES:
-            return lang_input_lower # Already a valid code
-
-        # Check OpenAI's mapping (name -> code)
-        if lang_input_lower in OPENAI_WHISPER_TO_LANGUAGE_CODE:
-            code = OPENAI_WHISPER_TO_LANGUAGE_CODE[lang_input_lower]
-            if code in FASTER_WHISPER_LANGUAGE_CODES:
-                return code
-            else: # Mapped to a code not in FasterWhisper's explicit list (should be rare)
-                 warnings.warn(f"Language name '{lang_input}' mapped to '{code}', which is not in FasterWhisper's known codes. Using '{code}' anyway.")
-                 return code
-
-
-        # Fallback if no mapping found
-        available_codes_str = ", ".join(sorted(list(FASTER_WHISPER_LANGUAGE_CODES)))
-        available_names_str = ", ".join(sorted([name for name, code in OPENAI_WHISPER_TO_LANGUAGE_CODE.items() if code in FASTER_WHISPER_LANGUAGE_CODES]))
-        raise ValueError(
-            f"Language '{lang_input}' is not a valid language code or name for FasterWhisper. "
-            f"Known codes: {available_codes_str}. Known names (mapped to codes): {available_names_str}."
-        )
 
 
 # --- Factory Function to Load Transcriber ---
 def load_transcriber(
     model_name: str = "medium",
-    whisper_type: str = 'openai-ipex-llm', # Default to OpenAI with IPEX-LLM potential
+    whisper_type: str = 'openai-ipex-llm', # Default to OpenAI with IPEX-LLM
     download_root: Optional[str] = WHISPER_DEFAULT_PATH,
     device: Optional[Union[str, torch.device]] = None, # Allow None to use SCRAIBE_TORCH_DEVICE
     **kwargs: Any  # Pass through all other specific arguments
 ) -> Transcriber:
     """
-    Factory function to load and initialize a specific type of Whisper transcriber.
+    Factory function to load and initialize a Whisper transcriber with IPEX-LLM optimization.
 
     Args:
         model_name (str): Whisper model name (e.g., "tiny", "base", "medium", "large-v2").
         whisper_type (str): Type of Whisper implementation to use.
-                            Options: "openai-ipex-llm" (or "whisper"), "faster-whisper".
+                            Currently only supports "openai-ipex-llm" (or "whisper").
         download_root (Optional[str]): Path for model downloads/cache.
         device (Optional[Union[str, torch.device]]): Target device (e.g., "cpu", "cuda", "xpu").
                                                      Defaults to SCRAIBE_TORCH_DEVICE.
-        **kwargs: Additional arguments passed to the specific transcriber's load_model method.
+        **kwargs: Additional arguments passed to the transcriber's load_model method.
                   For "openai-ipex-llm": in_memory, use_ipex_llm, low_bit.
-                  For "faster-whisper": compute_type, cpu_threads, num_workers.
 
     Returns:
         Transcriber: An initialized transcriber instance.
@@ -836,18 +515,10 @@ def load_transcriber(
             device_option=target_device,
             **kwargs # Passes in_memory, use_ipex_llm, low_bit, etc.
         )
-    elif whisper_type_lower == 'faster-whisper':
-        # `compute_type`, `cpu_threads`, etc. can be passed via kwargs
-        return FasterWhisperTranscriber.load_model(
-            model_name=model_name,
-            download_root=download_root,
-            device_option=target_device,
-            **kwargs # Passes compute_type, cpu_threads, etc.
-        )
     else:
         raise ValueError(
             f"Whisper type '{whisper_type}' not recognized. "
-            f"Choose from 'openai-ipex-llm' (or 'whisper'), 'faster-whisper'."
+            f"Only 'openai-ipex-llm' (or 'whisper') is supported."
         )
 
 if __name__ == '__main__':
@@ -897,33 +568,6 @@ if __name__ == '__main__':
 
     except Exception as e:
         print(f"Error testing OpenAIWhisperIPEXLLMTranscriber: {e}")
-        import traceback
-        traceback.print_exc()
-
-    # --- Test FasterWhisper ---
-    print("\n--- Testing FasterWhisperTranscriber ---")
-    try:
-        fw_device = "cuda" if torch.cuda.is_available() else "cpu"
-        fw_compute = "float16" if fw_device == "cuda" else "int8"
-        
-        transcriber_faster = load_transcriber(
-            model_name="tiny",
-            whisper_type="faster-whisper",
-            device=fw_device,
-            compute_type=fw_compute # Specific kwarg for FasterWhisper
-        )
-        print(f"Loaded FasterWhisper transcriber on {fw_device} with compute_type='{fw_compute}'")
-
-        result_faster = transcriber_faster.transcribe(audio_source, language="en") # Pass language kwarg
-        print(f"FasterWhisper Text: '{result_faster.get('text', 'N/A')}'")
-        if result_faster.get("segments"):
-            print("Segments (first 3):")
-            for seg in result_faster["segments"][:3]:
-                 print(f"  ID {seg.get('id')}: [{seg.get('start',0):.2f}s -> {seg.get('end',0):.2f}s] {seg.get('text','N/A')}")
-        # transcriber_faster.save_transcript(result_faster, "faster_whisper_transcript.txt")
-
-    except Exception as e:
-        print(f"Error testing FasterWhisperTranscriber: {e}")
         import traceback
         traceback.print_exc()
 

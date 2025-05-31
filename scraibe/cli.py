@@ -35,9 +35,9 @@ def cli():
     parser.add_argument("-f", "--audio-files", nargs="+", type=str, default=None,
                         help="List of audio files to transcribe.")
 
-    parser.add_argument("--whisper-type", type=str, default="whisper",
-                        choices=["whisper", "faster-whisper"],
-                        help="Type of Whisper model to use ('whisper' or 'faster-whisper').")
+    parser.add_argument("--whisper-type", type=str, default="openai-ipex-llm",
+                        choices=["openai-ipex-llm", "whisper"],
+                        help="Type of Whisper model to use (only 'openai-ipex-llm' or 'whisper' supported).")
 
     parser.add_argument("--whisper-model-name", default="medium",
                         help="Name of the Whisper model to use.")
