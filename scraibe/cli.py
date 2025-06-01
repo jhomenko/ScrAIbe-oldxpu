@@ -8,9 +8,11 @@ import os
 import json
 from argparse import ArgumentParser, ArgumentDefaultsHelpFormatter
 from whisper.tokenizer import LANGUAGES, TO_LANGUAGE_CODE
+import torch
 from torch.cuda import is_available
 from .autotranscript import Scraibe
 from .misc import set_threads
+from .transcriber import load_transcriber
 
 def cli():
     """
@@ -52,7 +54,7 @@ def cli():
                         help="HuggingFace token for private model download.")
 
     parser.add_argument("--inference-device",
-                        default="cuda" if is_available() else "cpu",
+                        default=("xpu" if hasattr(torch, "xpu") and torch.xpu.is_available() else ("cuda" if is_available() else "cpu")),
                         help="Device to use for PyTorch inference (e.g., 'cpu', 'cuda', 'xpu').")
 
     parser.add_argument("--num-threads", type=int, default=None,
@@ -81,6 +83,10 @@ def cli():
                         help="Language spoken in the audio. Specify None to perform language detection.")
     parser.add_argument("--num-speakers", type=int, default=None, # Default to None, let autotranscribe handle default if not set
                         help="Number of speakers in the audio (used by autotranscribe).")
+    parser.add_argument("--batch-size", type=int, default=8,
+                        help="Batch size for Whisper inference.")
+    parser.add_argument("--low-bit", type=str, default="bf16",
+                        help="Low-bit loading format for IPEX-LLM (e.g., bf16, sym_int4).")
 
     args = parser.parse_args()
     arg_dict = vars(args)
@@ -212,38 +218,28 @@ def cli():
                     print(f"Error saving diarization JSON for {audio_file_path}: {e}")
 
 
-            elif task_to_perform == "transcribe" or task_to_perform == "translate":
-                # CRITICAL FIX: Assign to 'transcription_output_dict' (or any name, e.g. 'out')
-                transcription_output_dict = model.transcribe(
-                    audio_file_path, 
+            elif task_to_perform in ("transcribe", "translate"):
+                import soundfile as sf
+                audio_data, sr = sf.read(audio_file_path)
+#                if sr != SAMPLE_RATE:
+#                    raise ValueError(f"Expected sample rate {SAMPLE_RATE}, got {sr}")
+                transcriber = load_transcriber(
+                    model_name=class_kwargs['whisper_model'],
+                    whisper_type=class_kwargs['whisper_type'],
+                    download_root=class_kwargs.get('download_root'),
+                    device=class_kwargs['target_device'],
+                    low_bit=arg_dict.pop('low_bit')
+                )
+                result = transcriber.transcribe(
+                    audio_data,
                     task=task_to_perform,
                     language=language_arg,
-                    verbose=verbose_arg
+                    verbose=verbose_arg,
+                    batch_size=arg_dict.pop('batch_size')
                 )
-                
-                save_path = f"{output_path_base}.txt" # Default to .txt
-                
-                # Optional: Handle other formats if model.transcribe output (a dict) supports them
-                if output_file_format == 'json':
-                    save_path = f"{output_path_base}.json"
-                    print(f'Saving full transcription dictionary to {save_path}')
-                    try:
-                        with open(save_path, "w", encoding='utf-8') as f:
-                            json.dump(transcription_output_dict, f, indent=2) # Save the whole dict
-                    except Exception as e:
-                        print(f"Error saving transcription JSON for {audio_file_path}: {e}")
-                else: # Default to saving only text to .txt
-                    if output_file_format != 'txt':
-                        print(f"Warning: Transcription task with output format '{output_file_format}' will save text to .txt. "
-                              f"For full dictionary, use --output-format json.")
-                    
-                    print(f'Saving transcription text to {save_path}')
-                    try:
-                        with open(save_path, "w", encoding='utf-8') as f:
-                            # Use the SAME variable name here that holds the dictionary
-                            f.write(transcription_output_dict.get("text", "")) 
-                    except Exception as e:
-                        print(f"Error saving transcription text for {audio_file_path}: {e}")
+                save_path = os.path.join(out_folder, f"{base_filename}.{output_file_format}")
+                print(f"Saving transcription to {save_path}")
+                transcriber.save_transcript(result, save_path)
     else:
         print("No audio files provided. Use the -f or --audio-files flag.")
 

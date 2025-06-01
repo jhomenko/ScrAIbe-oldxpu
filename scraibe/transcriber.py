@@ -41,6 +41,9 @@ from numpy import ndarray
 import warnings
 import numpy as np
 
+# Type definition for the Transcriber model instance
+ModelType = TypeVar('ModelType')
+
 # OpenAI Whisper imports
 from whisper.tokenizer import TO_LANGUAGE_CODE
 
@@ -71,9 +74,9 @@ except ImportError:
     SCRAIBE_TORCH_DEVICE = "cpu"
     SCRAIBE_NUM_THREADS = 4
 
-
-# Using a generic TypeVar for the model instance in the ABC
-ModelType = TypeVar('ModelType')
+# Apply threading settings to PyTorch
+if SCRAIBE_NUM_THREADS is not None:
+    torch.set_num_threads(SCRAIBE_NUM_THREADS)
 
 
 class Transcriber(ABC):
@@ -293,21 +296,27 @@ class OpenAIWhisperIPEXLLMTranscriber(Transcriber):
         initial_prompt = kwargs.get("initial_prompt")
         batch_size = kwargs.get("batch_size", 8)  # Default batch size of 8 chunks
         
-        # Process the audio
+        # Load audio: accept file path, numpy array, or tensor
         if isinstance(audio, str):
-            raise NotImplementedError("This transcribe method expects a waveform Tensor. Path loading should be handled by Scraibe.")
+            import soundfile as sf
+            data, sr = sf.read(audio)
+            if sr != SAMPLE_RATE:
+                warnings.warn(f"Resampling from {sr} to {SAMPLE_RATE}")
+                import librosa
+                data = librosa.resample(data.astype(np.float32), orig_sr=sr, target_sr=SAMPLE_RATE)
+            audio_array = data.astype(np.float32)
+        elif isinstance(audio, np.ndarray):
+            audio_array = audio.astype(np.float32)
+        elif isinstance(audio, torch.Tensor):
+            audio_array = audio.cpu().numpy().astype(np.float32)
         else:
-            # Handle tensor or ndarray input
-            if isinstance(audio, np.ndarray):
-                audio_tensor = torch.from_numpy(audio.astype(np.float32))
-            else:
-                audio_tensor = audio.to(torch.float32)
-            
-            if audio_tensor.ndim > 1:
-                audio_tensor = audio_tensor.squeeze()
-            
-            if self.verbose:
-                print(f"Processing audio with shape {audio_tensor.shape}, using chunk_length={CHUNK_LENGTH}s")
+            raise TypeError(f"Unsupported audio input type: {type(audio)}")
+        # Convert to tensor
+        audio_tensor = torch.from_numpy(audio_array)
+        if audio_tensor.ndim > 1:
+            audio_tensor = audio_tensor.squeeze()
+        if self.verbose:
+            print(f"Processing audio with shape {audio_tensor.shape}, using chunk_length={CHUNK_LENGTH}s")
         
         # Get model dtype and device for proper input feature conversion
         model_dtype = next(self.model.parameters()).dtype
@@ -381,33 +390,14 @@ class OpenAIWhisperIPEXLLMTranscriber(Transcriber):
                 prompt_ids = torch.tensor([prompt_ids], device="cpu")  # Keep on CPU initially
                 generate_kwargs["decoder_input_ids"] = prompt_ids
             
-            # Generate and decode on target device, with optional CPU fallback
-            try:
-                if self.verbose:
-                    print(f"Attempting generation on {model_device} with {model_dtype}")
-                input_features = input_features.to(model_device, dtype=model_dtype)
-                if "decoder_input_ids" in generate_kwargs:
-                    generate_kwargs["decoder_input_ids"] = generate_kwargs["decoder_input_ids"].to(model_device)
-                generated_ids = self.model.generate(input_features, **generate_kwargs)
-                transcriptions = self.processor.batch_decode(generated_ids, skip_special_tokens=True)
-            except Exception as e:
-                if self.verbose:
-                    print(f"Generation failed on {model_device}: {e}")
-                # Fallback to CPU
-                if model_device.type != "cpu":
-                    cpu_device = torch.device("cpu")
-                    if self.verbose:
-                        print("Retrying generation on CPU")
-                    try:
-                        input_features = input_features.to(cpu_device, dtype=model_dtype)
-                        if "decoder_input_ids" in generate_kwargs:
-                            generate_kwargs["decoder_input_ids"] = generate_kwargs["decoder_input_ids"].to(cpu_device)
-                        self.model = self.model.to(cpu_device)
-                        generated_ids = self.model.generate(input_features, **generate_kwargs)
-                        transcriptions = self.processor.batch_decode(generated_ids, skip_special_tokens=True)
-                    except Exception as e2:
-                        raise RuntimeError(f"Generation failed on both {model_device} and CPU: {e2}")
-                else:
+            # Generate and decode on target device
+            input_features = input_features.to(model_device, dtype=model_dtype)
+            if "decoder_input_ids" in generate_kwargs:
+                generate_kwargs["decoder_input_ids"] = generate_kwargs["decoder_input_ids"].to(model_device)
+            generated_ids = self.model.generate(input_features, **generate_kwargs)
+            if model_device.type == "xpu":
+                torch.xpu.synchronize()
+            transcriptions = self.processor.batch_decode(generated_ids, skip_special_tokens=True)
             
             # Process each result in the batch
             for i, (transcription, (chunk_start, chunk_end)) in enumerate(zip(transcriptions, chunk_boundaries)):
