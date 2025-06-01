@@ -331,107 +331,24 @@ class OpenAIWhisperIPEXLLMTranscriber(Transcriber):
             if decoder_prompt_ids:
                 self.model.config.forced_decoder_ids = decoder_prompt_ids
         
-        # Calculate number of samples per chunk
-        samples_per_chunk = CHUNK_LENGTH * SAMPLE_RATE
-        
-        # Calculate number of chunks
-        audio_length = audio_tensor.shape[0]
-        num_chunks = max(1, int(np.ceil(audio_length / samples_per_chunk)))
-        
-        all_segments = []
-        full_text_parts = []
-        
-        # Process chunks in batches
-        for batch_start in range(0, num_chunks, batch_size):
-            batch_end = min(batch_start + batch_size, num_chunks)
-            current_batch_size = batch_end - batch_start
-            
-            if self.verbose:
-                print(f"Processing batch of {current_batch_size} chunks ({batch_start+1}-{batch_end}/{num_chunks})")
-            
-            # Prepare batch of input features on CPU
-            batch_features = []
-            chunk_boundaries = []
-            
-            for i in range(batch_start, batch_end):
-                # Calculate chunk boundaries
-                start_sample = i * samples_per_chunk
-                end_sample = min(start_sample + samples_per_chunk, audio_length)
-                
-                # Extract chunk
-                chunk_start = max(0, start_sample)
-                chunk_end = min(end_sample, audio_length)
-                chunk = audio_tensor[chunk_start:chunk_end]
-                
-                # Store boundaries for later use
-                chunk_boundaries.append((chunk_start, chunk_end))
-                
-                # Process features on CPU with float32
-                with torch.no_grad():
-                    features = self.processor(
-                        chunk.cpu().numpy(),
-                        sampling_rate=SAMPLE_RATE,
-                        return_tensors="pt"
-                    ).input_features.to(torch.float32)
-                    # Cast features to model device and dtype to match model parameters
-                    features = features.to(model_device, dtype=model_dtype)
-
-                    batch_features.append(features)
-            
-            # Stack features if more than one chunk in the batch, otherwise use the single features tensor
-            if len(batch_features) > 1:
-                input_features = torch.cat(batch_features, dim=0)
-            else:
-                input_features = batch_features[0]
-            generated_ids = None # Or some other default
-            # Add initial prompt if specified and this is the first batch
-            if initial_prompt and batch_start == 0:
-                prompt_ids = self.processor.tokenizer.encode(initial_prompt, add_special_tokens=False)
-                prompt_ids = torch.tensor([prompt_ids], device="cpu")  # Keep on CPU initially
-                generate_kwargs["decoder_input_ids"] = prompt_ids
-            
-            # Generate and decode on target device
-            input_features = input_features.to(model_device, dtype=model_dtype)
-            if "decoder_input_ids" in generate_kwargs:
-                generate_kwargs["decoder_input_ids"] = generate_kwargs["decoder_input_ids"].to(model_device)
+        # Processor-based feature extraction and single-pass generation
+        with torch.no_grad():
+            inputs = self.processor(
+                audio_array.tolist() if isinstance(audio_array, np.ndarray) else audio_array,
+                sampling_rate=SAMPLE_RATE,
+                return_tensors="pt",
+                truncation=False,
+                padding="longest"
+            )
+            input_features = inputs.input_features.to(model_device, dtype=model_dtype)
             generated_ids = self.model.generate(input_features, **generate_kwargs)
             if model_device.type == "xpu":
                 torch.xpu.synchronize()
-            transcriptions = self.processor.batch_decode(generated_ids, skip_special_tokens=True)
-            
-            # Process each result in the batch
-            for i, (transcription, (chunk_start, chunk_end)) in enumerate(zip(transcriptions, chunk_boundaries)):
-                chunk_idx = batch_start + i
-                
-                # Calculate timestamps
-                chunk_start_time = chunk_start / SAMPLE_RATE
-                chunk_end_time = chunk_end / SAMPLE_RATE
-                
-                # Add to segments
-                all_segments.append({
-                    "id": chunk_idx,
-                    "start": chunk_start_time,
-                    "end": chunk_end_time,
-                    "text": transcription,
-                    "temperature": generate_kwargs.get("temperature", 0.0),
-                    "avg_logprob": -99.0,  # Placeholder
-                    "compression_ratio": 0.0,  # Placeholder
-                    "no_speech_prob": 0.0,  # Placeholder
-                })
-                
-                full_text_parts.append(transcription)
-                
-                if self.verbose:
-                    print(f"Chunk {chunk_idx+1}/{num_chunks}: {chunk_start_time:.2f}s - {chunk_end_time:.2f}s")
+            decoded = self.processor.batch_decode(generated_ids, skip_special_tokens=True)
         
-        # Combine all transcriptions
-        full_text = " ".join(full_text_parts)
-        
-        return {
-            "text": full_text,
-            "segments": all_segments,
-            "language": language
-        }
+        # Return combined text
+        full_text = " ".join(decoded) if isinstance(decoded, list) else decoded
+        return {"text": full_text, "segments": [], "language": language}
 
 
     @staticmethod
