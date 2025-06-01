@@ -280,9 +280,9 @@ class OpenAIWhisperIPEXLLMTranscriber(Transcriber):
 
     def transcribe(self, audio: Union[str, torch.Tensor, np.ndarray], **kwargs: Any) -> Dict[str, Any]:
         """
-        Transcribe audio using the IPEX-LLM optimized Whisper model with direct approach.
-        This implementation properly chunks audio with padding on either side and processes
-        in batches to make full use of the GPU.
+        Transcribe audio using the IPEX-LLM optimized Whisper model with hybrid CPU-GPU approach.
+        This implementation properly chunks audio, processes features on CPU, and then batches
+        them for efficient GPU processing.
         """
         if not self.processor or not self.model:
             raise RuntimeError("Transcriber is not properly initialized with a model and processor.")
@@ -291,6 +291,7 @@ class OpenAIWhisperIPEXLLMTranscriber(Transcriber):
         language = kwargs.get("language", "en")
         task = kwargs.get("task", "transcribe")
         initial_prompt = kwargs.get("initial_prompt")
+        batch_size = kwargs.get("batch_size", 8)  # Default batch size of 8 chunks
         
         # Process the audio
         if isinstance(audio, str):
@@ -308,8 +309,9 @@ class OpenAIWhisperIPEXLLMTranscriber(Transcriber):
             if self.verbose:
                 print(f"Processing audio with shape {audio_tensor.shape}, using chunk_length={CHUNK_LENGTH}s")
         
-        # Get model dtype for proper input feature conversion
+        # Get model dtype and device for proper input feature conversion
         model_dtype = next(self.model.parameters()).dtype
+        model_device = next(self.model.parameters()).device
         
         # Prepare generate kwargs
         generate_kwargs = self._get_transcribe_kwargs(**kwargs)
@@ -330,160 +332,107 @@ class OpenAIWhisperIPEXLLMTranscriber(Transcriber):
         all_segments = []
         full_text_parts = []
         
-        # Process each chunk
-        for i in range(num_chunks):
-            # Calculate chunk boundaries
-            start_sample = i * samples_per_chunk
-            end_sample = min(start_sample + samples_per_chunk, audio_length)
+        # Process chunks in batches
+        for batch_start in range(0, num_chunks, batch_size):
+            batch_end = min(batch_start + batch_size, num_chunks)
+            current_batch_size = batch_end - batch_start
             
-            # Extract chunk with padding if possible
-            chunk_start = max(0, start_sample)
-            chunk_end = min(end_sample, audio_length)
+            if self.verbose:
+                print(f"Processing batch of {current_batch_size} chunks ({batch_start+1}-{batch_end}/{num_chunks})")
             
-            # Get the chunk
-            chunk = audio_tensor[chunk_start:chunk_end]
+            # Prepare batch of input features on CPU
+            batch_features = []
+            chunk_boundaries = []
             
-            # Convert to features
-            with torch.no_grad():
-                input_features = self.processor(
-                    chunk.cpu().numpy(), 
-                    sampling_rate=SAMPLE_RATE,
-                    return_tensors="pt"
-                ).input_features.to(torch.float32)  # Ensure input features are float32 initially
+            for i in range(batch_start, batch_end):
+                # Calculate chunk boundaries
+                start_sample = i * samples_per_chunk
+                end_sample = min(start_sample + samples_per_chunk, audio_length)
+                
+                # Extract chunk
+                chunk_start = max(0, start_sample)
+                chunk_end = min(end_sample, audio_length)
+                chunk = audio_tensor[chunk_start:chunk_end]
+                
+                # Store boundaries for later use
+                chunk_boundaries.append((chunk_start, chunk_end))
+                
+                # Process features on CPU with float32
+                with torch.no_grad():
+                    features = self.processor(
+                        chunk.cpu().numpy(),
+                        sampling_rate=SAMPLE_RATE,
+                        return_tensors="pt"
+                    ).input_features.to(torch.float32)
+                    # Cast features to model device and dtype to match model parameters
+                    features = features.to(model_device, dtype=model_dtype)
+
+                    batch_features.append(features)
             
-            # Get the model's dtype for consistent precision
-            model_dtype = next(self.model.parameters()).dtype
-            model_device = next(self.model.parameters()).device
-            
-            # Convert input features to match model's precision and device
-            try:
-                input_features = input_features.to(model_device, dtype=model_dtype)
-                if self.verbose:
-                    print(f"Input features converted to {model_dtype} on {model_device}")
-            except RuntimeError as e:
-                if "could not create an engine" in str(e) and model_device.type == "xpu":
-                    warnings.warn(f"XPU engine creation failed: {e}. Will try alternative approach.")
-                    # Try with explicit BFloat16 if model is using it
-                    if model_dtype == torch.bfloat16:
-                        try:
-                            input_features = input_features.to(model_device, dtype=torch.bfloat16)
-                            if self.verbose:
-                                print(f"Input features explicitly converted to BFloat16 on {model_device}")
-                        except RuntimeError:
-                            warnings.warn(f"Failed to convert input features to BFloat16 on XPU. Falling back to CPU.")
-                            input_features = input_features.to("cpu", dtype=torch.float32)
-                    else:
-                        warnings.warn(f"Falling back to CPU with float32.")
-                        input_features = input_features.to("cpu", dtype=torch.float32)
-                else:
-                    raise
-            
-            # Add initial prompt if specified and this is the first chunk
-            if initial_prompt and i == 0:
+            # Stack features if more than one chunk in the batch, otherwise use the single features tensor
+            if len(batch_features) > 1:
+                input_features = torch.cat(batch_features, dim=0)
+            else:
+                input_features = batch_features[0]
+            generated_ids = None # Or some other default
+            # Add initial prompt if specified and this is the first batch
+            if initial_prompt and batch_start == 0:
                 prompt_ids = self.processor.tokenizer.encode(initial_prompt, add_special_tokens=False)
-                prompt_ids = torch.tensor([prompt_ids], device=self.target_device)
+                prompt_ids = torch.tensor([prompt_ids], device="cpu")  # Keep on CPU initially
                 generate_kwargs["decoder_input_ids"] = prompt_ids
             
-            # Generate transcription
-            if self.verbose:
-                print(f"Processing chunk {i+1}/{num_chunks} ({chunk_start/SAMPLE_RATE:.2f}s - {chunk_end/SAMPLE_RATE:.2f}s)")
-            
-            # Try to generate with the model on its current device
+            # Generate and decode on target device, with optional CPU fallback
             try:
-                # Ensure input features match model dtype
-                model_dtype = next(self.model.parameters()).dtype
-                model_device = next(self.model.parameters()).device
-                
-                # Re-check and ensure input features match model dtype and device
-                if input_features.dtype != model_dtype or input_features.device != model_device:
+                if self.verbose:
+                    print(f"Attempting generation on {model_device} with {model_dtype}")
+                input_features = input_features.to(model_device, dtype=model_dtype)
+                if "decoder_input_ids" in generate_kwargs:
+                    generate_kwargs["decoder_input_ids"] = generate_kwargs["decoder_input_ids"].to(model_device)
+                generated_ids = self.model.generate(input_features, **generate_kwargs)
+                transcriptions = self.processor.batch_decode(generated_ids, skip_special_tokens=True)
+            except Exception as e:
+                if self.verbose:
+                    print(f"Generation failed on {model_device}: {e}")
+                # Fallback to CPU
+                if model_device.type != "cpu":
+                    cpu_device = torch.device("cpu")
                     if self.verbose:
-                        print(f"Re-aligning input features to {model_dtype} on {model_device}")
-                    input_features = input_features.to(model_device, dtype=model_dtype)
-                
-                # Generate with proper dtype alignment
-                generated_ids = self.model.generate(
-                    input_features,
-                    **generate_kwargs
-                )
-            except RuntimeError as e:
-                error_msg = str(e)
-                if "could not create an engine" in error_msg and model_device.type == "xpu":
-                    warnings.warn(f"XPU engine creation failed during generation: {e}. Will try alternative approach.")
+                        print("Retrying generation on CPU")
                     try:
-                        # Try with explicit BFloat16 if that's what the model is using
-                        if model_dtype == torch.bfloat16:
-                            if self.verbose:
-                                print("Trying with explicit BFloat16 conversion")
-                            # Ensure all inputs are BFloat16
-                            input_features = input_features.to(model_device, dtype=torch.bfloat16)
-                            generated_ids = self.model.generate(
-                                input_features,
-                                **generate_kwargs
-                            )
-                        else:
-                            raise RuntimeError("Model is not using BFloat16, cannot apply BFloat16 workaround")
-                    except RuntimeError as e2:
-                        # If explicit BFloat16 also fails, try CPU fallback as last resort
-                        warnings.warn(f"XPU with explicit BFloat16 also failed: {e2}. Falling back to CPU as last resort.")
-                        # Move model to CPU
-                        self.model = self.model.to("cpu")
-                        # Ensure input features are on CPU with float32
-                        input_features = input_features.to("cpu", dtype=torch.float32)
-                        # Try again on CPU
-                        generated_ids = self.model.generate(
-                            input_features,
-                            **generate_kwargs
-                        )
-                elif "Input type" in error_msg and "bias type" in error_msg and model_device.type == "xpu":
-                    # Handle type mismatch errors specifically
-                    warnings.warn(f"Type mismatch during generation: {e}. Trying to align types.")
-                    # Try to determine the required type from the error message
-                    if "BFloat16" in error_msg:
-                        if self.verbose:
-                            print("Error suggests BFloat16 is needed. Converting inputs.")
-                        input_features = input_features.to(model_device, dtype=torch.bfloat16)
-                    elif "Float16" in error_msg:
-                        if self.verbose:
-                            print("Error suggests Float16 is needed. Converting inputs.")
-                        input_features = input_features.to(model_device, dtype=torch.float16)
-                    else:
-                        # Default to float32 if we can't determine the type
-                        if self.verbose:
-                            print("Using float32 as fallback precision.")
-                        input_features = input_features.to(model_device, dtype=torch.float32)
-                    
-                    # Try generation again with adjusted types
-                    generated_ids = self.model.generate(
-                        input_features,
-                        **generate_kwargs
-                    )
+                        input_features = input_features.to(cpu_device, dtype=model_dtype)
+                        if "decoder_input_ids" in generate_kwargs:
+                            generate_kwargs["decoder_input_ids"] = generate_kwargs["decoder_input_ids"].to(cpu_device)
+                        self.model = self.model.to(cpu_device)
+                        generated_ids = self.model.generate(input_features, **generate_kwargs)
+                        transcriptions = self.processor.batch_decode(generated_ids, skip_special_tokens=True)
+                    except Exception as e2:
+                        raise RuntimeError(f"Generation failed on both {model_device} and CPU: {e2}")
                 else:
-                    # For other errors, re-raise
-                    raise
             
-            # Decode the generated ids
-            transcription = self.processor.batch_decode(
-                generated_ids, 
-                skip_special_tokens=True
-            )[0]
-            
-            # Calculate timestamps
-            chunk_start_time = chunk_start / SAMPLE_RATE
-            chunk_end_time = chunk_end / SAMPLE_RATE
-            
-            # Add to segments
-            all_segments.append({
-                "id": i,
-                "start": chunk_start_time,
-                "end": chunk_end_time,
-                "text": transcription,
-                "temperature": generate_kwargs.get("temperature", 0.0),
-                "avg_logprob": -99.0,  # Placeholder
-                "compression_ratio": 0.0,  # Placeholder
-                "no_speech_prob": 0.0,  # Placeholder
-            })
-            
-            full_text_parts.append(transcription)
+            # Process each result in the batch
+            for i, (transcription, (chunk_start, chunk_end)) in enumerate(zip(transcriptions, chunk_boundaries)):
+                chunk_idx = batch_start + i
+                
+                # Calculate timestamps
+                chunk_start_time = chunk_start / SAMPLE_RATE
+                chunk_end_time = chunk_end / SAMPLE_RATE
+                
+                # Add to segments
+                all_segments.append({
+                    "id": chunk_idx,
+                    "start": chunk_start_time,
+                    "end": chunk_end_time,
+                    "text": transcription,
+                    "temperature": generate_kwargs.get("temperature", 0.0),
+                    "avg_logprob": -99.0,  # Placeholder
+                    "compression_ratio": 0.0,  # Placeholder
+                    "no_speech_prob": 0.0,  # Placeholder
+                })
+                
+                full_text_parts.append(transcription)
+                
+                if self.verbose:
+                    print(f"Chunk {chunk_idx+1}/{num_chunks}: {chunk_start_time:.2f}s - {chunk_end_time:.2f}s")
         
         # Combine all transcriptions
         full_text = " ".join(full_text_parts)

@@ -4,13 +4,13 @@ from scraibe.transcriber import load_transcriber
 from scraibe.audio import AudioProcessor
 
 def main():
-    # Load the transcriber with IPEX-LLM optimization but on CPU
+    # Load the transcriber with IPEX-LLM optimization
     print("Loading transcriber...")
     transcriber = load_transcriber(
-        model_name="tiny",
+        model_name="medium",
         whisper_type="openai-ipex-llm",
-        device="cpu",  # Changed from "xpu" to "cpu"
-        low_bit="bf16", # Using bf16 which is a valid value
+        device="cpu",  # Try with XPU first, will fall back to CPU if needed
+        #low_bit="bf16", # Using bf16 which is a valid value
         #verbose=True
     )
     
@@ -21,12 +21,13 @@ def main():
     # Ensure waveform is float32
     waveform = audio_processor.waveform.to(dtype=torch.float32)
     
-    # Transcribe audio
-    print("Transcribing audio...")
+    # Transcribe audio with batching
+    print("Transcribing audio with batching...")
     result = transcriber.transcribe(
         audio=waveform,
         language="en",
-        verbose=True
+        verbose=True,
+        batch_size=4  # Process 4 chunks at a time
     )
     
     # Print result
